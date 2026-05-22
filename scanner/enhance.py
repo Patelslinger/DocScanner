@@ -16,21 +16,8 @@ def clahe(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: tuple = (8
 
 
 def sharpen(image: np.ndarray, strength: float = 1.5) -> np.ndarray:
-    kernel = np.array([
-        [0, -1, 0],
-        [-1, 5, -1],
-        [0, -1, 0],
-    ], dtype=np.float32)
-
-    # 5 为中性值，通过 strength 控制锐化程度
-    kernel[1, 1] = 4 * strength + 1
-    kernel = kernel * (1.0 / (1 + 4 * strength)) + (1 - 1.0 / (1 + 4 * strength)) * np.array([
-        [0, 0, 0],
-        [0, 1, 0],
-        [0, 0, 0],
-    ], dtype=np.float32)
-
-    return cv2.filter2D(image, -1, kernel)
+    blurred = cv2.GaussianBlur(image, (0, 0), 3)
+    return cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
 
 
 def binarize(image: np.ndarray, method: str = "otsu", block_size: int = 11, c: int = 2) -> np.ndarray:

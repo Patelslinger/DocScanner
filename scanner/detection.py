@@ -47,7 +47,7 @@ def find_document_contour(image: np.ndarray, edges: np.ndarray | None = None) ->
             continue
 
         approx = approximate_polygon(cnt, epsilon_factor=0.05)
-        if len(approx) == 4:
+        if len(approx) == 4 and cv2.isContourConvex(approx):
             return approx.reshape(4, 2)
 
     return None
