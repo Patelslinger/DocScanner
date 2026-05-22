@@ -10,6 +10,7 @@
 
 ## 环境配置
 
+
 ### pip 安装
 ```bash
 pip install opencv-python==4.8.1.78 numpy==1.26.4 Pillow==10.1.0 img2pdf==0.5.1
