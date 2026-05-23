@@ -1,12 +1,13 @@
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from . import preprocessing, detection, transform, enhance, io_utils
 
 
 class DocScanner:
-    def __init__(self, canny_low: int = 75, canny_high: int = 200,
+    def __init__(self, canny_low: int | None = None, canny_high: int | None = None,
                  clahe: bool = True, sharpen: bool = True,
                  binarize: bool = False, binarize_method: str = "otsu",
                  output_dir: str | Path | None = None):
@@ -20,16 +21,29 @@ class DocScanner:
 
     def scan_image(self, image: np.ndarray) -> dict:
         original = image.copy()
-        gray = preprocessing.grayscale(image)
-        blurred = preprocessing.gaussian_blur(gray)
+        gray_raw = preprocessing.grayscale(image)
 
-        edges = detection.canny_edge(blurred, low=self.canny_low, high=self.canny_high)
-        corners = detection.find_document_contour(gray, edges)
+        gray_versions = [gray_raw]
+        if self.do_clahe:
+            gray_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray_raw)
+            gray_versions.append(gray_clahe)
 
-        if corners is None:
+        best_corners = None
+        best_score = -9999
+        h, w = gray_raw.shape[:2]
+
+        for gray in gray_versions:
+            corners = detection.find_document_contour(gray, bgr=original)
+            if corners is not None:
+                s = detection._score_quad(corners, w, h)
+                if s > best_score:
+                    best_score = s
+                    best_corners = corners
+
+        if best_corners is None:
             return {"success": False, "error": "Could not detect document corners", "original": original}
 
-        ordered = detection.order_corners(corners)
+        ordered = detection.order_corners(best_corners)
         warped = transform.perspective_transform(original, ordered)
         warped = transform.pad_to_a4(warped)
 
@@ -44,8 +58,7 @@ class DocScanner:
         return {
             "success": True,
             "original": original,
-            "gray": gray,
-            "edges": edges,
+            "gray": gray_raw,
             "corners": ordered,
             "warped": warped,
             **enhanced,
