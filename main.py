@@ -15,10 +15,10 @@ def main():
     scan_parser.add_argument("input", type=str, help="输入图片路径")
     scan_parser.add_argument("-o", "--output-dir", type=str, default="./output",
                              help="输出目录 (default: ./output)")
-    scan_parser.add_argument("--canny-low", type=int, default=75,
-                             help="Canny 低阈值 (default: 75)")
-    scan_parser.add_argument("--canny-high", type=int, default=200,
-                             help="Canny 高阈值 (default: 200)")
+    scan_parser.add_argument("--canny-low", type=int, default=None,
+                             help="Canny 低阈值 (default: 自动计算)")
+    scan_parser.add_argument("--canny-high", type=int, default=None,
+                             help="Canny 高阈值 (default: 自动计算)")
     scan_parser.add_argument("--no-clahe", action="store_true", help="禁用 CLAHE")
     scan_parser.add_argument("--no-sharpen", action="store_true", help="禁用锐化")
     scan_parser.add_argument("--binarize", action="store_true", help="启用二值化")
@@ -30,8 +30,8 @@ def main():
     batch_parser.add_argument("input_dir", type=str, help="输入目录")
     batch_parser.add_argument("-o", "--output-dir", type=str, default="./output",
                               help="输出目录 (default: ./output)")
-    batch_parser.add_argument("--canny-low", type=int, default=75)
-    batch_parser.add_argument("--canny-high", type=int, default=200)
+    batch_parser.add_argument("--canny-low", type=int, default=None)
+    batch_parser.add_argument("--canny-high", type=int, default=None)
     batch_parser.add_argument("--no-clahe", action="store_true")
     batch_parser.add_argument("--no-sharpen", action="store_true")
     batch_parser.add_argument("--binarize", action="store_true")
