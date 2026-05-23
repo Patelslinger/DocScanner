@@ -90,6 +90,17 @@ def _score_quad(quad: np.ndarray, w: int, h: int) -> float:
         return -1000
     border_penalty = border_hit * 12  # 适度扣分，不直接拒绝
 
+    # ---- 矩形度：轮廓面积 / boundingRect 面积 ----
+    x, y, bw, bh = cv2.boundingRect(quad.reshape(4, 1, 2).astype(np.int32))
+    bbox_area = bw * bh
+    if bbox_area > 0:
+        rect_ratio = area / bbox_area
+        if rect_ratio < 0.65:
+            return -500  # 远非矩形，排除
+        rect_score = (rect_ratio - 0.65) * 40  # 0.65→0, 1.0→14
+    else:
+        rect_score = 0
+
     # ---- 对边平行度 ----
     def _side_ratio(a, b):
         return min(a, b) / max(a, b) if max(a, b) > 0 else 0
@@ -111,12 +122,432 @@ def _score_quad(quad: np.ndarray, w: int, h: int) -> float:
         elif 40 <= deg <= 140:
             angle_score += 2
 
-    return area_score + parallel_score + angle_score - border_penalty
+    return area_score + parallel_score + angle_score + rect_score - border_penalty
 
 
 # ---------------------------------------------------------------------------
-# 策略 0：亮度区域分割（最优先，最可靠）
+# 策略 0：射线搜索（最优先，不依赖完整边缘）
 # ---------------------------------------------------------------------------
+
+def _radial_search(gray: np.ndarray, bgr: np.ndarray | None,
+                   min_area: float) -> np.ndarray | None:
+    """从图像中心向外发射射线，沿每条射线找梯度最大处作为纸张边界。
+
+    先用大核模糊消除文字干扰，再沿射线求梯度，梯度峰值 = 纸张→背景转折点。
+    """
+    h, w = gray.shape[:2]
+    cy, cx = h // 2, w // 2
+
+    # ---- 模糊消除文字干扰 ----
+    blur_k = max(11, min(h, w) // 50)
+    if blur_k % 2 == 0:
+        blur_k += 1
+    gray_blur = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
+
+    # ---- 计算梯度幅值图（用于沿射线找梯度峰值） ----
+    gx = cv2.Sobel(gray_blur, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_blur, cv2.CV_64F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+    # ---- 180 条射线，每条找梯度最大处 ----
+    boundary_pts = []
+    max_radius = max(w, h)
+
+    for angle_deg in range(0, 360, 2):
+        rad = np.radians(angle_deg)
+        dx, dy = np.cos(rad), np.sin(rad)
+
+        best_step = 0
+        best_grad = -1
+
+        for step in range(10, max_radius, 2):
+            x = int(cx + dx * step)
+            y = int(cy + dy * step)
+            if x < 2 or x >= w - 2 or y < 2 or y >= h - 2:
+                if best_step == 0:
+                    boundary_pts.append((x, y))
+                break
+
+            g = grad_mag[y, x]
+            if g > best_grad:
+                best_grad = g
+                best_step = step
+
+        if best_step > 0:
+            bx = int(cx + dx * best_step)
+            by = int(cy + dy * best_step)
+            boundary_pts.append((bx, by))
+
+    if len(boundary_pts) < 30:
+        return None
+
+    # ---- 过滤：去掉距离中心太近的噪声点 ----
+    pts_array = np.array(boundary_pts, dtype=np.float32)
+    distances = np.sqrt((pts_array[:, 0] - cx) ** 2 + (pts_array[:, 1] - cy) ** 2)
+    median_dist = np.median(distances)
+    if median_dist < 20:
+        return None
+    keep = (distances > median_dist * 0.25) & (distances < median_dist * 2.5)
+    pts_filtered = pts_array[keep]
+
+    if len(pts_filtered) < 20:
+        return None
+
+    # ---- 用边界点的质心作为参考原点，按象限分组 ----
+    centroid_x, centroid_y = pts_filtered[:, 0].mean(), pts_filtered[:, 1].mean()
+    quad = _quadrant_fit_quad(pts_filtered, centroid_x, centroid_y, w, h)
+    if quad is None:
+        return None
+
+    # ---- 在原始梯度图上微调角点 ----
+    quad = _refine_corners_on_edges(quad, gray, w, h)
+
+    s = _score_quad(quad, w, h)
+    if s > 0:
+        return quad
+
+    return None
+
+
+def _quadrant_fit_quad(points: np.ndarray, cx: float, cy: float,
+                        w: int, h: int) -> np.ndarray | None:
+    """将边界点按相对中心的方位分 4 组，每组拟合一条边，求交点。"""
+    # 按角度分 4 组：右(315-45) 下(45-135) 左(135-225) 上(225-315)
+    dx = points[:, 0] - cx
+    dy = points[:, 1] - cy
+    angles = np.degrees(np.arctan2(dy, dx)) % 360
+
+    groups = {
+        'right': points[(angles < 45) | (angles >= 315)],
+        'bottom': points[(angles >= 45) & (angles < 135)],
+        'left': points[(angles >= 135) & (angles < 225)],
+        'top': points[(angles >= 225) & (angles < 315)],
+    }
+
+    lines = {}
+    for name, group_pts in groups.items():
+        if len(group_pts) < 5:
+            continue
+        # RANSAC 拟合一条直线
+        line = _ransac_line(group_pts)
+        if line is not None:
+            # 确保法向量朝外
+            a, b, c = line
+            if name == 'top' and b > 0:
+                a, b, c = -a, -b, -c
+            elif name == 'bottom' and b < 0:
+                a, b, c = -a, -b, -c
+            elif name == 'left' and a > 0:
+                a, b, c = -a, -b, -c
+            elif name == 'right' and a < 0:
+                a, b, c = -a, -b, -c
+            lines[name] = (a, b, c)
+
+    if len(lines) < 3:
+        return None
+
+    # ---- 迭代精修：将点重新分配到最近的线，重新拟合 ----
+    lines = _iterative_line_fit(lines, points, 3)
+
+    # 需要至少 3 条边
+    if len(lines) < 3:
+        return None
+
+    # 如果只有 3 条边，补一条对边（平行 + 偏移）
+    if len(lines) == 3:
+        if 'top' not in lines and 'bottom' in lines:
+            a, b, c = lines['bottom']
+            lines['top'] = (a, b, c - 200)  # 近似偏移
+        elif 'bottom' not in lines and 'top' in lines:
+            a, b, c = lines['top']
+            lines['bottom'] = (a, b, c + 200)
+        elif 'left' not in lines and 'right' in lines:
+            a, b, c = lines['right']
+            lines['left'] = (a, b, c - 200)
+        elif 'right' not in lines and 'left' in lines:
+            a, b, c = lines['left']
+            lines['right'] = (a, b, c + 200)
+
+    if len(lines) < 4:
+        return None
+
+    # 计算相邻边的交点
+    order = ['top', 'right', 'bottom', 'left']
+    corners = []
+    for i in range(4):
+        name_a, name_b = order[i], order[(i + 1) % 4]
+        if name_a not in lines or name_b not in lines:
+            return None
+        a1, b1, c1 = lines[name_a]
+        a2, b2, c2 = lines[name_b]
+        det = a1 * b2 - a2 * b1
+        if abs(det) < 1e-6:
+            return None
+        px = (b1 * c2 - b2 * c1) / det
+        py = (a2 * c1 - a1 * c2) / det
+        corners.append([px, py])
+
+    quad = np.array(corners, dtype=np.float32)
+    if not cv2.isContourConvex(quad.reshape(4, 1, 2)):
+        return None
+
+    return quad
+
+
+def _ransac_line(points: np.ndarray) -> tuple | None:
+    """对一组点做 RANSAC 直线拟合，返回 (a, b, c) 使得 ax+by+c=0。"""
+    if len(points) < 5:
+        return None
+
+    best_line = None
+    best_inliers = 0
+
+    for _ in range(50):
+        idx = np.random.choice(len(points), 2, replace=False)
+        p1, p2 = points[idx[0]], points[idx[1]]
+        if np.linalg.norm(p2 - p1) < 15:
+            continue
+
+        a = p1[1] - p2[1]
+        b = p2[0] - p1[0]
+        c = p1[0] * p2[1] - p2[0] * p1[1]
+        norm = np.sqrt(a * a + b * b)
+        if norm < 1e-6:
+            continue
+        a, b, c = a / norm, b / norm, c / norm
+
+        # 计算内点数
+        dists = np.abs(a * points[:, 0] + b * points[:, 1] + c)
+        inliers = np.sum(dists < 4)
+
+        if inliers > best_inliers:
+            best_inliers = inliers
+            best_line = (a, b, c)
+
+    return best_line
+
+
+def _iterative_line_fit(lines: dict, points: np.ndarray,
+                         iterations: int = 3) -> dict:
+    """迭代精修：将每个点分配到最近的线，重新拟合，重复 N 次。"""
+    if len(lines) < 2:
+        return lines
+
+    for _ in range(iterations):
+        # 将每个点分配到最近的线
+        assigned = {name: [] for name in lines}
+        for pt in points:
+            best_name, best_dist = None, float('inf')
+            for name, (a, b, c) in lines.items():
+                dist = abs(a * pt[0] + b * pt[1] + c)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_name = name
+            if best_name is not None:
+                assigned[best_name].append(pt)
+
+        # 重新拟合每条线
+        new_lines = {}
+        for name, pts in assigned.items():
+            if len(pts) < 5:
+                new_lines[name] = lines[name]  # 保持旧线
+            else:
+                pts_arr = np.array(pts, dtype=np.float32)
+                new_line = _ransac_line(pts_arr)
+                if new_line is not None:
+                    a, b, c = new_line
+                    # 保持法向量方向一致
+                    old_a, old_b, old_c = lines[name]
+                    if a * old_a + b * old_b < 0:
+                        a, b, c = -a, -b, -c
+                    new_lines[name] = (a, b, c)
+                else:
+                    new_lines[name] = lines[name]
+
+        lines = new_lines
+
+    return lines
+
+
+def _refine_corners_on_edges(quad: np.ndarray, gray: np.ndarray,
+                              w: int, h: int) -> np.ndarray:
+    """沿每条边采样多个点，分别搜索法线方向最强梯度，微调角点位置。"""
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+    refined = quad.copy()
+
+    for i in range(4):
+        p1 = refined[i]
+        p2 = refined[(i + 1) % 4]
+        edge_vec = p2 - p1
+        edge_len = np.linalg.norm(edge_vec)
+        if edge_len < 10:
+            continue
+        edge_dir = edge_vec / edge_len
+        normal = np.array([-edge_dir[1], edge_dir[0]])
+
+        # 沿边采样 5 个点，分别搜索
+        shifts = []
+        for t in np.linspace(0.15, 0.85, 5):  # 避开端点
+            sample_pt = p1 + edge_vec * t
+            best_shift = 0
+            best_grad = 0
+            for s in range(-20, 21, 2):
+                sp = sample_pt + normal * s
+                sx, sy = int(np.clip(sp[0], 3, w - 4)), int(np.clip(sp[1], 3, h - 4))
+                g = grad_mag[sy - 1:sy + 2, sx - 1:sx + 2].mean()
+                if g > best_grad:
+                    best_grad = g
+                    best_shift = s
+            shifts.append(best_shift)
+
+        if shifts:
+            # 取中位数偏移（抗噪声）
+            med_shift = np.median(shifts)
+            if abs(med_shift) >= 1:
+                refined[i] = refined[i] + normal * med_shift
+                refined[(i + 1) % 4] = refined[(i + 1) % 4] + normal * med_shift
+
+    refined[:, 0] = np.clip(refined[:, 0], 2, w - 3)
+    refined[:, 1] = np.clip(refined[:, 1], 2, h - 3)
+
+    return refined
+
+
+def _ransac_fit_quad(points: np.ndarray, w: int, h: int) -> np.ndarray | None:
+    """从边界点中用 RANSAC 拟合 4 条直线，计算交点得到四边形角点。"""
+    best_quad, best_score = None, -9999
+
+    for _ in range(60):  # RANSAC 迭代 60 次
+        if len(points) < 8:
+            break
+
+        # 随机选择 4 组点，每组拟合一条直线
+        n_pts = len(points)
+        lines = []
+
+        for _ in range(4):
+            # 随机选两个点拟合直线
+            idx = np.random.choice(n_pts, 2, replace=False)
+            p1, p2 = points[idx[0]], points[idx[1]]
+            if np.linalg.norm(p2 - p1) < 10:
+                continue
+            # 直线: ax + by + c = 0
+            a = p1[1] - p2[1]
+            b = p2[0] - p1[0]
+            c = p1[0] * p2[1] - p2[0] * p1[1]
+            norm = np.sqrt(a * a + b * b)
+            if norm < 1e-6:
+                continue
+            a, b, c = a / norm, b / norm, c / norm
+
+            # 确保法向量朝向图像内部
+            cx_img, cy_img = w / 2, h / 2
+            if a * cx_img + b * cy_img + c > 0:
+                a, b, c = -a, -b, -c
+
+            lines.append((a, b, c))
+
+        if len(lines) < 4:
+            continue
+
+        # 计算四条直线的交点
+        corners = []
+        for i in range(4):
+            for j in range(i + 1, 4):
+                a1, b1, c1 = lines[i]
+                a2, b2, c2 = lines[j]
+                det = a1 * b2 - a2 * b1
+                if abs(det) < 1e-6:
+                    continue
+                px = (b1 * c2 - b2 * c1) / det
+                py = (a2 * c1 - a1 * c2) / det
+                if -50 < px < w + 50 and -50 < py < h + 50:
+                    corners.append((px, py))
+
+        if len(corners) < 4:
+            continue
+
+        # 从交点中选出 4 个最可能形成文档的角点
+        corners = np.array(corners, dtype=np.float32)
+        hull = cv2.convexHull(corners.reshape(-1, 1, 2))
+        if hull is None or len(hull) < 4:
+            continue
+
+        peri = cv2.arcLength(hull, True)
+        approx = cv2.approxPolyDP(hull, 0.05 * peri, True)
+        if len(approx) != 4:
+            continue
+
+        quad = approx.reshape(4, 2).astype(np.float32)
+        if not cv2.isContourConvex(quad.reshape(4, 1, 2)):
+            continue
+
+        s = _score_quad(quad, w, h)
+        if s > best_score:
+            best_score = s
+            best_quad = quad
+
+    return best_quad
+
+
+# ---------------------------------------------------------------------------
+# 策略 1：Sobel 固定阈值边缘检测
+
+def _sobel_fixed_edge(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
+    """Sobel X+Y 固定阈值边缘检测：先对 BGR 模糊去噪，再灰度化 + Sobel 边缘。"""
+    h, w = bgr.shape[:2]
+    border = 25
+    padded = cv2.copyMakeBorder(bgr, border, border, border, border,
+                                 cv2.BORDER_CONSTANT, value=(0, 0, 0))
+
+    # 1. BGR 高斯模糊去噪 → 灰度化
+    blurred = cv2.GaussianBlur(padded, (3, 3), 0)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+
+    # 2. Sobel X + Y，各乘 1.5 增强弱边缘
+    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_x = np.uint8(np.absolute(sobel_x) * 1.5)
+    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    sobel_y = np.uint8(np.absolute(sobel_y) * 1.5)
+    edge = cv2.bitwise_or(sobel_x, sobel_y)
+
+    # 3. 多阈值尝试（从低到高，优先低阈值抓住弱边缘）
+    for thresh_val in (30, 40, 50, 60, 70):
+        _, edge_binary = cv2.threshold(edge, thresh_val, 255, cv2.THRESH_BINARY)
+
+        # 轻微膨胀连接断裂边缘
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        dilated = cv2.dilate(edge_binary, kernel, iterations=2)
+
+        contours = _find_contours(dilated)
+        if not contours:
+            continue
+        contours = _sort_by_area(contours)
+
+        for cnt in contours[:5]:
+            if cv2.contourArea(cnt) < min_area:
+                continue
+            peri = cv2.arcLength(cnt, True)
+            for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+                approx = cv2.approxPolyDP(cnt, eps * peri, True)
+                quad = _extract_quad(approx)
+                if quad is None:
+                    continue
+                if not cv2.isContourConvex(quad.reshape(4, 1, 2)):
+                    continue
+                quad_adj = quad - border
+                s = _score_quad(quad_adj, w, h)
+                if s > 0:
+                    return quad_adj
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 策略 1：亮度区域分割
 
 def _find_by_bright_region(gray: np.ndarray, min_area: float) -> np.ndarray | None:
     """将纸张作为图像中最亮的连通区域来检测，使用中心参考阈值。"""
@@ -462,12 +893,14 @@ def find_document_contour(image: np.ndarray,
     min_area = (h * w) * 0.05
 
     strategies = [
-        ("bright",    lambda: _find_by_bright_region(gray, min_area)),
-        ("canny",     lambda: _canny_sweep(gray, min_area)),
-        ("adaptive",  lambda: _adaptive_threshold(gray, min_area)),
-        ("sobel",     lambda: _sobel_gradient(gray, min_area)),
-        ("color",     lambda: _color_segmentation(bgr_input, min_area) if bgr_input is not None else None),
-        ("hough",     lambda: _hough_lines(gray)),
+        ("radial",       lambda: _radial_search(gray, bgr_input, min_area)),
+        ("sobel_fixed",  lambda: _sobel_fixed_edge(bgr_input, min_area) if bgr_input is not None else None),
+        ("bright",       lambda: _find_by_bright_region(gray, min_area)),
+        ("canny",        lambda: _canny_sweep(gray, min_area)),
+        ("adaptive",     lambda: _adaptive_threshold(gray, min_area)),
+        ("sobel",        lambda: _sobel_gradient(gray, min_area)),
+        ("color",        lambda: _color_segmentation(bgr_input, min_area) if bgr_input is not None else None),
+        ("hough",        lambda: _hough_lines(gray)),
     ]
 
     best_quad, best_score = None, -9999
@@ -476,6 +909,8 @@ def find_document_contour(image: np.ndarray,
         try:
             quad = strategy()
             if quad is not None:
+                # 在梯度图上微调角点
+                quad = _refine_corners_on_edges(quad, gray, w, h)
                 s = _score_quad(quad, w, h)
                 if s > best_score:
                     best_score = s
