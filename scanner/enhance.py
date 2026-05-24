@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from .config import default_config as _cfg
+
 
 def clahe(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: tuple = (8, 8)) -> np.ndarray:
     if len(image.shape) == 3:
@@ -15,8 +17,10 @@ def clahe(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: tuple = (8
     return clahe_obj.apply(image)
 
 
-def sharpen(image: np.ndarray, strength: float = 1.5) -> np.ndarray:
-    blurred = cv2.GaussianBlur(image, (0, 0), 3)
+def sharpen(image: np.ndarray, strength: float | None = None) -> np.ndarray:
+    if strength is None:
+        strength = _cfg.enhance.sharpen_strength
+    blurred = cv2.GaussianBlur(image, (0, 0), _cfg.enhance.sharpen_sigma)
     return cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
 
 

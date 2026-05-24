@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 
 from . import preprocessing, detection, transform, enhance, io_utils
+from .config import default_config as _cfg
 
 
 class DocScanner:
@@ -25,7 +26,10 @@ class DocScanner:
 
         gray_versions = [gray_raw]
         if self.do_clahe:
-            gray_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray_raw)
+            gray_clahe = cv2.createCLAHE(
+                clipLimit=_cfg.pipeline.clahe_clip,
+                tileGridSize=(_cfg.pipeline.clahe_tile, _cfg.pipeline.clahe_tile),
+            ).apply(gray_raw)
             gray_versions.append(gray_clahe)
 
         best_corners = None
@@ -37,17 +41,23 @@ class DocScanner:
                 gray, bgr=original,
                 canny_low=self.canny_low, canny_high=self.canny_high,
             )
-            if corners is not None:
-                s = detection._score_quad(corners, w, h)
-                if s > best_score:
-                    best_score = s
-                    best_corners = corners
+            if corners is None:
+                continue
+            s = detection._score_quad(corners, w, h)
+            # 只要 raw 检测成功，就不启用 CLAHE 的结果。
+            # CLAHE 虽然分数可能更高，但容易把内部纹理误认为边缘。
+            if best_corners is not None and gray is not gray_raw:
+                continue
+            if s > best_score:
+                best_score = s
+                best_corners = corners
 
         if best_corners is None:
             return {"success": False, "error": "Could not detect document corners", "original": original}
 
         ordered = detection.order_corners(best_corners)
         canny_debug = detection.draw_corners_on_canny(gray_raw, ordered)
+        annotated = detection.draw_document_contour(original, ordered)
         warped = transform.perspective_transform(original, ordered)
         warped = transform.pad_to_a4(warped)
 
@@ -65,6 +75,7 @@ class DocScanner:
             "gray": gray_raw,
             "corners": ordered,
             "canny_debug": canny_debug,
+            "annotated": annotated,
             "warped": warped,
             **enhanced,
         }
@@ -102,6 +113,7 @@ class DocScanner:
 
         io_utils.save_image(result["warped"], out_dir / f"{stem}_warped.jpg")
         io_utils.save_image(result["canny_debug"], out_dir / f"{stem}_canny_debug.jpg")
+        io_utils.save_image(result["annotated"], out_dir / f"{stem}_annotated.jpg")
 
         if "binary" in result and result["binary"] is not result["final"]:
             io_utils.save_image(result["binary"], out_dir / f"{stem}_binary.jpg")

@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from .config import default_config as _cfg
+
 
 # ---------------------------------------------------------------------------
 # 基础工具
@@ -39,7 +41,7 @@ def _extract_quad(approx: np.ndarray) -> np.ndarray | None:
     if len(approx) > 4:
         hull = cv2.convexHull(approx)
         peri = cv2.arcLength(hull, True)
-        for eps in (0.02, 0.05, 0.08, 0.12):
+        for eps in _cfg.extract.eps_values:
             simplified = cv2.approxPolyDP(hull, eps * peri, True)
             if len(simplified) == 4:
                 return simplified.reshape(4, 2).astype(np.float32)
@@ -62,7 +64,7 @@ def _score_quad(quad: np.ndarray, w: int, h: int) -> float:
     h_lef = np.linalg.norm(bl - tl)
     h_rig = np.linalg.norm(br - tr)
     min_side = min(w_top, w_bot, h_lef, h_rig)
-    if min_side < 15:
+    if min_side < _cfg.scoring.min_side:
         return -1000
 
     # ---- 面积比例 ----
@@ -70,30 +72,33 @@ def _score_quad(quad: np.ndarray, w: int, h: int) -> float:
     img_area = w * h
     ratio = area / img_area
 
-    if ratio < 0.06:
+    if ratio < _cfg.scoring.area_min_ratio:
         return -1000
-    if ratio > 0.98:
+    if ratio > _cfg.scoring.area_max_ratio:
         return -500  # 整张图，说明没检测到纸张
 
-    area_score = 25 if 0.20 <= ratio <= 0.93 else (10 if 0.10 <= ratio < 0.20 else 0)
+    area_score = (_cfg.scoring.area_full_score
+                  if _cfg.scoring.area_full_min <= ratio <= _cfg.scoring.area_full_max
+                  else (_cfg.scoring.area_partial_score
+                        if _cfg.scoring.area_partial_min <= ratio < _cfg.scoring.area_full_min
+                        else 0))
 
     # ---- 角点贴边检测 ----
-    # 允许 1-2 个角点贴边（纸张可能被画面裁剪），但 3+ 个贴边则为误检
-    margin = 5
+    margin = _cfg.scoring.border_margin
     border_hit = 0
     for pt in quad:
         x, y = pt
         if x <= margin or x >= w - 1 - margin or y <= margin or y >= h - 1 - margin:
             border_hit += 1
 
-    if border_hit >= 3:
+    if border_hit >= _cfg.scoring.border_max_hits:
         return -1000
-    border_penalty = border_hit * 12  # 适度扣分，不直接拒绝
+    border_penalty = border_hit * _cfg.scoring.border_penalty
 
     # ---- 对边平行度 ----
     def _side_ratio(a, b):
         return min(a, b) / max(a, b) if max(a, b) > 0 else 0
-    parallel_score = (_side_ratio(w_top, w_bot) + _side_ratio(h_lef, h_rig)) * 15
+    parallel_score = (_side_ratio(w_top, w_bot) + _side_ratio(h_lef, h_rig)) * _cfg.scoring.parallel_weight
 
     # ---- 内角合理性 ----
     angle_score = 0
@@ -106,19 +111,19 @@ def _score_quad(quad: np.ndarray, w: int, h: int) -> float:
             continue
         cos_a = np.clip(np.dot(v1, v2) / (n1 * n2), -1, 1)
         deg = np.degrees(np.arccos(cos_a))
-        if 55 <= deg <= 125:
-            angle_score += 6
-        elif 40 <= deg <= 140:
-            angle_score += 2
+        if _cfg.scoring.angle_full_min <= deg <= _cfg.scoring.angle_full_max:
+            angle_score += _cfg.scoring.angle_full_score
+        elif _cfg.scoring.angle_partial_min <= deg <= _cfg.scoring.angle_partial_max:
+            angle_score += _cfg.scoring.angle_partial_score
 
     # ---- 矩形度：轮廓面积 / boundingRect 面积 ----
     x, y, bw, bh = cv2.boundingRect(quad.reshape(4, 1, 2).astype(np.int32))
     bbox_area = bw * bh
     if bbox_area > 0:
         rect_ratio = area / bbox_area
-        if rect_ratio < 0.65:
+        if rect_ratio < _cfg.scoring.rect_ratio_reject:
             return -500
-        rect_score = (rect_ratio - 0.65) * 40
+        rect_score = (rect_ratio - _cfg.scoring.rect_ratio_base) * _cfg.scoring.rect_ratio_weight
     else:
         rect_score = 0
 
@@ -135,7 +140,7 @@ def _radial_search(gray: np.ndarray, bgr: np.ndarray | None,
     h, w = gray.shape[:2]
     cy, cx = h // 2, w // 2
 
-    blur_k = max(11, min(h, w) // 50)
+    blur_k = max(_cfg.radial.blur_k_min, min(h, w) // _cfg.radial.blur_k_div)
     if blur_k % 2 == 0:
         blur_k += 1
     gray_blur = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
@@ -147,11 +152,11 @@ def _radial_search(gray: np.ndarray, bgr: np.ndarray | None,
     boundary_pts = []
     max_radius = max(w, h)
 
-    for angle_deg in range(0, 360, 2):
+    for angle_deg in range(0, 360, _cfg.radial.angle_step):
         rad = np.radians(angle_deg)
         dx, dy = np.cos(rad), np.sin(rad)
         best_step, best_grad = 0, -1
-        for step in range(10, max_radius, 2):
+        for step in range(_cfg.radial.step_start, max_radius, _cfg.radial.step_inc):
             x = int(cx + dx * step)
             y = int(cy + dy * step)
             if x < 2 or x >= w - 2 or y < 2 or y >= h - 2:
@@ -167,18 +172,18 @@ def _radial_search(gray: np.ndarray, bgr: np.ndarray | None,
             by = int(cy + dy * best_step)
             boundary_pts.append((bx, by))
 
-    if len(boundary_pts) < 30:
+    if len(boundary_pts) < _cfg.radial.min_boundary_pts:
         return None
 
     pts_array = np.array(boundary_pts, dtype=np.float32)
     distances = np.sqrt((pts_array[:, 0] - cx) ** 2 + (pts_array[:, 1] - cy) ** 2)
     median_dist = np.median(distances)
-    if median_dist < 20:
+    if median_dist < _cfg.radial.min_median_dist:
         return None
-    keep = (distances > median_dist * 0.25) & (distances < median_dist * 2.5)
+    keep = (distances > median_dist * _cfg.radial.dist_lower_ratio) & (distances < median_dist * _cfg.radial.dist_upper_ratio)
     pts_filtered = pts_array[keep]
 
-    if len(pts_filtered) < 20:
+    if len(pts_filtered) < _cfg.radial.min_filtered_pts:
         return None
 
     centroid_x, centroid_y = pts_filtered[:, 0].mean(), pts_filtered[:, 1].mean()
@@ -198,18 +203,19 @@ def _quadrant_fit_quad(points: np.ndarray, cx: float, cy: float,
     """将边界点按相对中心的方位分 4 组，每组拟合一条边，求交点。"""
     dx = points[:, 0] - cx
     dy = points[:, 1] - cy
+    a = _cfg.quadrant.angles
     angles = np.degrees(np.arctan2(dy, dx)) % 360
 
     groups = {
-        'right': points[(angles < 45) | (angles >= 315)],
-        'bottom': points[(angles >= 45) & (angles < 135)],
-        'left': points[(angles >= 135) & (angles < 225)],
-        'top': points[(angles >= 225) & (angles < 315)],
+        'right': points[(angles < a[0]) | (angles >= a[3])],
+        'bottom': points[(angles >= a[0]) & (angles < a[1])],
+        'left': points[(angles >= a[1]) & (angles < a[2])],
+        'top': points[(angles >= a[2]) & (angles < a[3])],
     }
 
     lines = {}
     for name, group_pts in groups.items():
-        if len(group_pts) < 5:
+        if len(group_pts) < _cfg.quadrant.min_group_pts:
             continue
         line = _ransac_line(group_pts)
         if line is not None:
@@ -227,24 +233,25 @@ def _quadrant_fit_quad(points: np.ndarray, cx: float, cy: float,
     if len(lines) < 3:
         return None
 
-    lines = _iterative_line_fit(lines, points, 3)
+    lines = _iterative_line_fit(lines, points, _cfg.quadrant.fit_iterations)
 
     if len(lines) < 3:
         return None
 
+    off = _cfg.quadrant.missing_edge_offset
     if len(lines) == 3:
         if 'top' not in lines and 'bottom' in lines:
             a, b, c = lines['bottom']
-            lines['top'] = (a, b, c - 200)
+            lines['top'] = (a, b, c - off)
         elif 'bottom' not in lines and 'top' in lines:
             a, b, c = lines['top']
-            lines['bottom'] = (a, b, c + 200)
+            lines['bottom'] = (a, b, c + off)
         elif 'left' not in lines and 'right' in lines:
             a, b, c = lines['right']
-            lines['left'] = (a, b, c - 200)
+            lines['left'] = (a, b, c - off)
         elif 'right' not in lines and 'left' in lines:
             a, b, c = lines['left']
-            lines['right'] = (a, b, c + 200)
+            lines['right'] = (a, b, c + off)
 
     if len(lines) < 4:
         return None
@@ -272,14 +279,14 @@ def _quadrant_fit_quad(points: np.ndarray, cx: float, cy: float,
 
 def _ransac_line(points: np.ndarray) -> tuple | None:
     """对一组点做 RANSAC 直线拟合，返回 (a, b, c) 使得 ax+by+c=0。"""
-    if len(points) < 5:
+    if len(points) < _cfg.ransac.min_points:
         return None
     best_line = None
     best_inliers = 0
-    for _ in range(50):
+    for _ in range(_cfg.ransac.iterations):
         idx = np.random.choice(len(points), 2, replace=False)
         p1, p2 = points[idx[0]], points[idx[1]]
-        if np.linalg.norm(p2 - p1) < 15:
+        if np.linalg.norm(p2 - p1) < _cfg.ransac.min_pt_distance:
             continue
         a = p1[1] - p2[1]
         b = p2[0] - p1[0]
@@ -289,7 +296,7 @@ def _ransac_line(points: np.ndarray) -> tuple | None:
             continue
         a, b, c = a / norm, b / norm, c / norm
         dists = np.abs(a * points[:, 0] + b * points[:, 1] + c)
-        inliers = np.sum(dists < 4)
+        inliers = np.sum(dists < _cfg.ransac.inlier_threshold)
         if inliers > best_inliers:
             best_inliers = inliers
             best_line = (a, b, c)
@@ -314,7 +321,7 @@ def _iterative_line_fit(lines: dict, points: np.ndarray,
                 assigned[best_name].append(pt)
         new_lines = {}
         for name, pts in assigned.items():
-            if len(pts) < 5:
+            if len(pts) < _cfg.ransac.min_points:
                 new_lines[name] = lines[name]
             else:
                 pts_arr = np.array(pts, dtype=np.float32)
@@ -343,18 +350,19 @@ def _refine_corners_on_edges(quad: np.ndarray, gray: np.ndarray,
         p2 = refined[(i + 1) % 4]
         edge_vec = p2 - p1
         edge_len = np.linalg.norm(edge_vec)
-        if edge_len < 10:
+        if edge_len < _cfg.refine.min_edge_len:
             continue
         edge_dir = edge_vec / edge_len
         normal = np.array([-edge_dir[1], edge_dir[0]])
         shifts = []
-        for t in np.linspace(0.15, 0.85, 5):
+        for t in np.linspace(_cfg.refine.sample_start, _cfg.refine.sample_end, _cfg.refine.sample_count):
             sample_pt = p1 + edge_vec * t
             best_shift = 0
             best_grad = 0
-            for s in range(-20, 21, 2):
+            for s in range(_cfg.refine.search_start, _cfg.refine.search_end, _cfg.refine.search_step):
                 sp = sample_pt + normal * s
-                sx, sy = int(np.clip(sp[0], 3, w - 4)), int(np.clip(sp[1], 3, h - 4))
+                m = _cfg.refine.search_margin
+                sx, sy = int(np.clip(sp[0], m, w - 1 - m)), int(np.clip(sp[1], m, h - 1 - m))
                 g = grad_mag[sy - 1:sy + 2, sx - 1:sx + 2].mean()
                 if g > best_grad:
                     best_grad = g
@@ -365,15 +373,16 @@ def _refine_corners_on_edges(quad: np.ndarray, gray: np.ndarray,
             if abs(med_shift) >= 1:
                 refined[i] = refined[i] + normal * med_shift
                 refined[(i + 1) % 4] = refined[(i + 1) % 4] + normal * med_shift
-    refined[:, 0] = np.clip(refined[:, 0], 2, w - 3)
-    refined[:, 1] = np.clip(refined[:, 1], 2, h - 3)
+    m = _cfg.refine.search_margin
+    refined[:, 0] = np.clip(refined[:, 0], m - 1, w - m)
+    refined[:, 1] = np.clip(refined[:, 1], m - 1, h - m)
     return refined
 
 
 def _ransac_fit_quad(points: np.ndarray, w: int, h: int) -> np.ndarray | None:
     """纯 RANSAC 同时拟合 4 条直线，计算交点得到四边形角点（备用）。"""
     best_quad, best_score = None, -9999
-    for _ in range(60):
+    for _ in range(_cfg.ransac_quad.iterations):
         if len(points) < 8:
             break
         n_pts = len(points)
@@ -381,7 +390,7 @@ def _ransac_fit_quad(points: np.ndarray, w: int, h: int) -> np.ndarray | None:
         for _ in range(4):
             idx = np.random.choice(n_pts, 2, replace=False)
             p1, p2 = points[idx[0]], points[idx[1]]
-            if np.linalg.norm(p2 - p1) < 10:
+            if np.linalg.norm(p2 - p1) < _cfg.ransac_quad.min_pt_distance:
                 continue
             a = p1[1] - p2[1]
             b = p2[0] - p1[0]
@@ -406,7 +415,8 @@ def _ransac_fit_quad(points: np.ndarray, w: int, h: int) -> np.ndarray | None:
                     continue
                 px = (b1 * c2 - b2 * c1) / det
                 py = (a2 * c1 - a1 * c2) / det
-                if -50 < px < w + 50 and -50 < py < h + 50:
+                m = _cfg.ransac_quad.outlier_margin
+                if -m < px < w + m and -m < py < h + m:
                     corners.append((px, py))
         if len(corners) < 4:
             continue
@@ -435,29 +445,31 @@ def _ransac_fit_quad(points: np.ndarray, w: int, h: int) -> np.ndarray | None:
 def _sobel_fixed_edge(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
     """Sobel X+Y 固定阈值边缘检测：先 BGR 模糊去噪，再灰度化 + Sobel。"""
     h, w = bgr.shape[:2]
-    border = 25
+    border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(bgr, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=(0, 0, 0))
-    blurred = cv2.GaussianBlur(padded, (3, 3), 0)
+    bk = _cfg.sobel_fixed.blur_kernel
+    blurred = cv2.GaussianBlur(padded, (bk, bk), 0)
     gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    scale = _cfg.sobel_fixed.sobel_scale
     sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_x = np.uint8(np.absolute(sobel_x) * 1.5)
+    sobel_x = np.uint8(np.absolute(sobel_x) * scale)
     sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    sobel_y = np.uint8(np.absolute(sobel_y) * 1.5)
+    sobel_y = np.uint8(np.absolute(sobel_y) * scale)
     edge = cv2.bitwise_or(sobel_x, sobel_y)
-    for thresh_val in (30, 40, 50, 60, 70):
+    for thresh_val in _cfg.sobel_fixed.thresholds:
         _, edge_binary = cv2.threshold(edge, thresh_val, 255, cv2.THRESH_BINARY)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dilated = cv2.dilate(edge_binary, kernel, iterations=2)
+        dilated = cv2.dilate(edge_binary, kernel, iterations=_cfg.sobel_fixed.dilate_iter)
         contours = _find_contours(dilated)
         if not contours:
             continue
         contours = _sort_by_area(contours)
-        for cnt in contours[:5]:
+        for cnt in contours[:_cfg.sobel_fixed.max_contours]:
             if cv2.contourArea(cnt) < min_area:
                 continue
             peri = cv2.arcLength(cnt, True)
-            for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+            for eps in _cfg.extract.contour_eps_values:
                 approx = cv2.approxPolyDP(cnt, eps * peri, True)
                 quad = _extract_quad(approx)
                 if quad is None:
@@ -485,7 +497,7 @@ def _find_by_bright_region(gray: np.ndarray, min_area: float) -> np.ndarray | No
     center_std = float(center_region.std())
 
     # 方法 A：基于中心亮度（中心区域通常就是纸张）
-    for n_std in (0.8, 1.0, 1.3, 1.6, 2.0, 2.5):
+    for n_std in _cfg.bright.n_std_values:
         thresh_val = center_mean - n_std * center_std
         if thresh_val < 10 or thresh_val > 248:
             continue
@@ -496,7 +508,7 @@ def _find_by_bright_region(gray: np.ndarray, min_area: float) -> np.ndarray | No
 
     # 方法 B：基于 Otsu 阈值（整体前景/背景分离）
     otsu_val, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    for offset in (0, 10, 20, -10, -20):
+    for offset in _cfg.bright.otsu_offsets:
         tv = otsu_val + offset
         if 10 <= tv <= 248:
             quad = _bright_region_from_threshold(gray, tv, min_area, h, w)
@@ -504,7 +516,7 @@ def _find_by_bright_region(gray: np.ndarray, min_area: float) -> np.ndarray | No
                 return quad
 
     # 方法 C：百分位阈值（回退）
-    for pct in (55, 60, 65, 70, 75):
+    for pct in _cfg.bright.percentiles:
         thresh_val = np.percentile(gray, pct)
         if thresh_val < 10 or thresh_val > 248:
             continue
@@ -518,28 +530,29 @@ def _find_by_bright_region(gray: np.ndarray, min_area: float) -> np.ndarray | No
 def _bright_region_from_threshold(gray: np.ndarray, thresh_val: int,
                                    min_area: float, h: int, w: int) -> np.ndarray | None:
     """给定阈值，从二值图中提取最大的连通区域并逼近四边形。"""
-    border = 25
+    border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
 
     _, binary = cv2.threshold(padded, thresh_val, 255, cv2.THRESH_BINARY)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)
-    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+    k = _cfg.bright.morph_kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=_cfg.bright.morph_close_iter)
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=_cfg.bright.morph_open_iter)
 
     contours = _find_contours(opened)
     if not contours:
         return None
 
     contours = _sort_by_area(contours)
-    for cnt in contours[:3]:
+    for cnt in contours[:_cfg.bright.max_contours]:
         if cv2.contourArea(cnt) < min_area:
             continue
 
         # 方法 A：直接用轮廓逼近（比 convexHull 更贴近实际纸张边界）
         peri = cv2.arcLength(cnt, True)
-        for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+        for eps in _cfg.extract.contour_eps_values:
             approx = cv2.approxPolyDP(cnt, eps * peri, True)
             quad = _extract_quad(approx)
             if quad is None:
@@ -573,7 +586,7 @@ def _canny_sweep(gray: np.ndarray, min_area: float,
     h, w = gray.shape[:2]
     best_quad, best_score = None, -9999
 
-    border = 25
+    border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
 
@@ -581,25 +594,26 @@ def _canny_sweep(gray: np.ndarray, min_area: float,
         threshold_pairs = [(canny_low, canny_high)]
     else:
         threshold_pairs = []
-        for sigma in (0.12, 0.20, 0.28, 0.36, 0.44, 0.52):
+        for sigma in _cfg.canny_sweep.sigma_values:
             threshold_pairs.append(auto_canny(padded, sigma))
 
     for low, high in threshold_pairs:
-        for bk in (3, 5):
+        for bk in _cfg.canny_sweep.blur_kernels:
             blurred = cv2.GaussianBlur(padded, (bk, bk), 0)
             edges = cv2.Canny(blurred, low, high)
-            for dil_iter in (2, 3, 4):
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            for dil_iter in _cfg.canny_sweep.dilate_iters:
+                dk = _cfg.canny_sweep.dilate_kernel
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dk, dk))
                 dilated = cv2.dilate(edges, kernel, iterations=dil_iter)
 
                 contours = _find_contours(dilated)
                 contours = _sort_by_area(contours)
 
-                for cnt in contours[:8]:
+                for cnt in contours[:_cfg.canny_sweep.max_contours]:
                     if cv2.contourArea(cnt) < min_area:
                         continue
                     peri = cv2.arcLength(cnt, True)
-                    for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+                    for eps in _cfg.extract.contour_eps_values:
                         approx = cv2.approxPolyDP(cnt, eps * peri, True)
                         quad = _extract_quad(approx)
                         if quad is None:
@@ -622,29 +636,30 @@ def _canny_sweep(gray: np.ndarray, min_area: float,
 
 def _adaptive_threshold(gray: np.ndarray, min_area: float) -> np.ndarray | None:
     h, w = gray.shape[:2]
-    border = 25
+    border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
 
-    for bs in [41, 61, 81, 111, 151]:
+    for bs in _cfg.adaptive.block_sizes:
         if bs % 2 == 0:
             bs += 1
         th = cv2.adaptiveThreshold(padded, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, bs, 4)
+                                    cv2.THRESH_BINARY, bs, _cfg.adaptive.c_value)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=5)
-        opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=2)
+        k = _cfg.adaptive.morph_kernel
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=_cfg.adaptive.morph_close_iter)
+        opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=_cfg.adaptive.morph_open_iter)
 
         contours = _find_contours(opened)
         contours = _sort_by_area(contours)
 
-        for cnt in contours[:5]:
+        for cnt in contours[:_cfg.adaptive.max_contours]:
             area = cv2.contourArea(cnt)
             if area < min_area:
                 continue
             peri = cv2.arcLength(cnt, True)
-            for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+            for eps in _cfg.extract.contour_eps_values:
                 approx = cv2.approxPolyDP(cnt, eps * peri, True)
                 quad = _extract_quad(approx)
                 if quad is None:
@@ -665,7 +680,7 @@ def _adaptive_threshold(gray: np.ndarray, min_area: float) -> np.ndarray | None:
 
 def _sobel_gradient(gray: np.ndarray, min_area: float) -> np.ndarray | None:
     h, w = gray.shape[:2]
-    border = 25
+    border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
 
@@ -674,20 +689,21 @@ def _sobel_gradient(gray: np.ndarray, min_area: float) -> np.ndarray | None:
     mag = np.sqrt(gx ** 2 + gy ** 2)
     mag = np.uint8(np.clip(mag, 0, 255))
 
-    for thresh in (25, 40, 60, 80):
+    for thresh in _cfg.sobel_grad.thresholds:
         _, binary = cv2.threshold(mag, thresh, 255, cv2.THRESH_BINARY)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dilated = cv2.dilate(binary, kernel, iterations=3)
+        dk = _cfg.sobel_grad.dilate_kernel
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dk, dk))
+        dilated = cv2.dilate(binary, kernel, iterations=_cfg.sobel_grad.dilate_iter)
 
         contours = _find_contours(dilated)
         contours = _sort_by_area(contours)
 
-        for cnt in contours[:5]:
+        for cnt in contours[:_cfg.sobel_grad.max_contours]:
             if cv2.contourArea(cnt) < min_area:
                 continue
             peri = cv2.arcLength(cnt, True)
-            for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+            for eps in _cfg.extract.contour_eps_values:
                 approx = cv2.approxPolyDP(cnt, eps * peri, True)
                 quad = _extract_quad(approx)
                 if quad is None:
@@ -708,7 +724,7 @@ def _sobel_gradient(gray: np.ndarray, min_area: float) -> np.ndarray | None:
 
 def _color_segmentation(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
     h, w = bgr.shape[:2]
-    border = 25
+    border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(bgr, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=(0, 0, 0))
     hsv = cv2.cvtColor(padded, cv2.COLOR_BGR2HSV)
@@ -716,31 +732,33 @@ def _color_segmentation(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
     s_ch, v_ch = hsv[:, :, 1], hsv[:, :, 2]
     l_ch = lab[:, :, 0]
 
-    masks = [
-        (s_ch < 30) & (v_ch > 130),
-        (s_ch < 40) & (v_ch > 150),
-        s_ch < 35,
-        l_ch > 170,
-        (s_ch < 25) & (v_ch > 100),
-    ]
+    p = _cfg.color_seg.mask_params
+    masks = []
+    # 按配置生成各 mask
+    mp = p[0]; masks.append((s_ch < mp["s_max"]) & (v_ch > mp["v_min"]))
+    mp = p[1]; masks.append((s_ch < mp["s_max"]) & (v_ch > mp["v_min"]))
+    mp = p[2]; masks.append(s_ch < mp["s_max"])
+    mp = p[3]; masks.append(l_ch > mp["l_min"])
+    mp = p[4]; masks.append((s_ch < mp["s_max"]) & (v_ch > mp["v_min"]))
 
     for raw in masks:
         mask = raw.astype(np.uint8) * 255
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=4)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        k = _cfg.color_seg.morph_kernel
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=_cfg.color_seg.morph_close_iter)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=_cfg.color_seg.morph_open_iter)
 
         contours = _find_contours(mask)
         if not contours:
             continue
         contours = _sort_by_area(contours)
 
-        for cnt in contours[:3]:
+        for cnt in contours[:_cfg.color_seg.max_contours]:
             if cv2.contourArea(cnt) < min_area:
                 continue
             peri = cv2.arcLength(cnt, True)
-            for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+            for eps in _cfg.extract.contour_eps_values:
                 approx = cv2.approxPolyDP(cnt, eps * peri, True)
                 quad = _extract_quad(approx)
                 if quad is None:
@@ -763,7 +781,7 @@ def _hough_lines(gray: np.ndarray,
                   canny_low: int | None = None,
                   canny_high: int | None = None) -> np.ndarray | None:
     h, w = gray.shape[:2]
-    border = 25
+    border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
     ph, pw = padded.shape[:2]
@@ -771,14 +789,14 @@ def _hough_lines(gray: np.ndarray,
     if canny_low is not None and canny_high is not None:
         threshold_pairs = [(canny_low, canny_high)]
     else:
-        threshold_pairs = [(30, 90), (50, 150), (75, 200), (25, 75)]
+        threshold_pairs = list(_cfg.hough.canny_thresholds)
 
     for low, high in threshold_pairs:
         edges = cv2.Canny(padded, low, high)
 
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                                minLineLength=min(pw, ph) // 5,
-                                maxLineGap=60)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=_cfg.hough.hough_threshold,
+                                minLineLength=min(pw, ph) // _cfg.hough.min_line_div,
+                                maxLineGap=_cfg.hough.max_line_gap)
         if lines is None or len(lines) < 4:
             continue
 
@@ -794,7 +812,7 @@ def _hough_lines(gray: np.ndarray,
             continue
 
         peri = cv2.arcLength(hull, True)
-        for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+        for eps in _cfg.extract.contour_eps_values:
             approx = cv2.approxPolyDP(hull, eps * peri, True)
             quad = _extract_quad(approx)
             if quad is None:
@@ -816,23 +834,24 @@ def _hough_lines(gray: np.ndarray,
 def _fallback_detect(gray: np.ndarray, min_area: float,
                      w: int, h: int) -> np.ndarray | None:
     """简单 Canny + 最大凸四边形检测，放宽评分要求作为最后兜底。"""
-    border = 25
+    border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
     low, high = auto_canny(padded)
     edges = cv2.Canny(padded, low, high)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    dilated = cv2.dilate(edges, kernel, iterations=2)
+    fk = _cfg.fallback.dilate_kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (fk, fk))
+    dilated = cv2.dilate(edges, kernel, iterations=_cfg.fallback.dilate_iter)
     contours = _find_contours(dilated)
     if not contours:
         return None
 
-    for cnt in _sort_by_area(contours)[:10]:
+    for cnt in _sort_by_area(contours)[:_cfg.fallback.max_contours]:
         area = cv2.contourArea(cnt)
         if area < min_area:
             continue
         peri = cv2.arcLength(cnt, True)
-        for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+        for eps in _cfg.extract.contour_eps_values:
             approx = cv2.approxPolyDP(cnt, eps * peri, True)
             quad = _extract_quad(approx)
             if quad is None:
@@ -843,7 +862,7 @@ def _fallback_detect(gray: np.ndarray, min_area: float,
             quad_adj[:, 0] = np.clip(quad_adj[:, 0], 0, w - 1)
             quad_adj[:, 1] = np.clip(quad_adj[:, 1], 0, h - 1)
             s = _score_quad(quad_adj, w, h)
-            if s > -500:
+            if s > _cfg.fallback.min_score:
                 return quad_adj
 
     return None
@@ -866,7 +885,7 @@ def find_document_contour(image: np.ndarray,
     gray = image if len(image.shape) == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     bgr_input = bgr if bgr is not None else (image if len(image.shape) == 3 else None)
     h, w = gray.shape[:2]
-    min_area = (h * w) * 0.05
+    min_area = (h * w) * _cfg.detection.min_area_ratio
 
     strategies = [
         ("radial",       lambda: _radial_search(gray, bgr_input, min_area)),
@@ -890,7 +909,7 @@ def find_document_contour(image: np.ndarray,
                 if s > best_score:
                     best_score = s
                     best_quad = quad
-                    if s > 70:
+                    if s > _cfg.scoring.early_break_score:
                         break
         except Exception:
             continue

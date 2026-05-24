@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+from .config import default_config as _cfg
 from .detection import order_corners
 
 
@@ -33,10 +34,10 @@ def perspective_transform(image: np.ndarray, corners: np.ndarray,
 def pad_to_a4(image: np.ndarray) -> np.ndarray:
     """将矫正后的图像居中放置到 A4 比例 (210:297) 的白色画布上."""
     h, w = image.shape[:2]
-    target_ratio = 210 / 297
+    target_ratio = _cfg.transform.a4_width / _cfg.transform.a4_height
 
     current_ratio = w / h
-    if abs(current_ratio - target_ratio) < 0.02:
+    if abs(current_ratio - target_ratio) < _cfg.transform.ratio_tolerance:
         return image
 
     if current_ratio > target_ratio:
