@@ -1,9 +1,12 @@
 import cv2
 import numpy as np
 
+from .detection import order_corners
+
 
 def perspective_transform(image: np.ndarray, corners: np.ndarray,
                           output_size: tuple[int, int] | None = None) -> np.ndarray:
+    corners = order_corners(corners)
     if output_size is None:
         tl, tr, br, bl = corners
         width_top = np.linalg.norm(tr - tl)

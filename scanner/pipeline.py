@@ -33,7 +33,10 @@ class DocScanner:
         h, w = gray_raw.shape[:2]
 
         for gray in gray_versions:
-            corners = detection.find_document_contour(gray, bgr=original)
+            corners = detection.find_document_contour(
+                gray, bgr=original,
+                canny_low=self.canny_low, canny_high=self.canny_high,
+            )
             if corners is not None:
                 s = detection._score_quad(corners, w, h)
                 if s > best_score:
@@ -44,6 +47,7 @@ class DocScanner:
             return {"success": False, "error": "Could not detect document corners", "original": original}
 
         ordered = detection.order_corners(best_corners)
+        canny_debug = detection.draw_corners_on_canny(gray_raw, ordered)
         warped = transform.perspective_transform(original, ordered)
         warped = transform.pad_to_a4(warped)
 
@@ -60,6 +64,7 @@ class DocScanner:
             "original": original,
             "gray": gray_raw,
             "corners": ordered,
+            "canny_debug": canny_debug,
             "warped": warped,
             **enhanced,
         }
@@ -96,6 +101,7 @@ class DocScanner:
         stem = result["path"].stem
 
         io_utils.save_image(result["warped"], out_dir / f"{stem}_warped.jpg")
+        io_utils.save_image(result["canny_debug"], out_dir / f"{stem}_canny_debug.jpg")
 
         if "binary" in result and result["binary"] is not result["final"]:
             io_utils.save_image(result["binary"], out_dir / f"{stem}_binary.jpg")

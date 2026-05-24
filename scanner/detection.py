@@ -567,26 +567,28 @@ def _bright_region_from_threshold(gray: np.ndarray, thresh_val: int,
 # 策略 1：多参数 Canny 扫描
 # ---------------------------------------------------------------------------
 
-def _canny_sweep(gray: np.ndarray, min_area: float) -> np.ndarray | None:
+def _canny_sweep(gray: np.ndarray, min_area: float,
+                  canny_low: int | None = None,
+                  canny_high: int | None = None) -> np.ndarray | None:
     h, w = gray.shape[:2]
     best_quad, best_score = None, -9999
 
-    # 给图像加黑边，防止纸张与图像边界粘连
     border = 25
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
 
-    sigmas = [0.12, 0.20, 0.28, 0.36, 0.44, 0.52]
-    blurs = [3, 5]
-    dilates = [2, 3, 4]
-    epsilons = [0.01, 0.02, 0.04, 0.06, 0.10]
+    if canny_low is not None and canny_high is not None:
+        threshold_pairs = [(canny_low, canny_high)]
+    else:
+        threshold_pairs = []
+        for sigma in (0.12, 0.20, 0.28, 0.36, 0.44, 0.52):
+            threshold_pairs.append(auto_canny(padded, sigma))
 
-    for sigma in sigmas:
-        low, high = auto_canny(padded, sigma)
-        for bk in blurs:
+    for low, high in threshold_pairs:
+        for bk in (3, 5):
             blurred = cv2.GaussianBlur(padded, (bk, bk), 0)
             edges = cv2.Canny(blurred, low, high)
-            for dil_iter in dilates:
+            for dil_iter in (2, 3, 4):
                 kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
                 dilated = cv2.dilate(edges, kernel, iterations=dil_iter)
 
@@ -597,7 +599,7 @@ def _canny_sweep(gray: np.ndarray, min_area: float) -> np.ndarray | None:
                     if cv2.contourArea(cnt) < min_area:
                         continue
                     peri = cv2.arcLength(cnt, True)
-                    for eps in epsilons:
+                    for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
                         approx = cv2.approxPolyDP(cnt, eps * peri, True)
                         quad = _extract_quad(approx)
                         if quad is None:
@@ -757,14 +759,21 @@ def _color_segmentation(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
 # 策略 5：Hough 直线检测
 # ---------------------------------------------------------------------------
 
-def _hough_lines(gray: np.ndarray) -> np.ndarray | None:
+def _hough_lines(gray: np.ndarray,
+                  canny_low: int | None = None,
+                  canny_high: int | None = None) -> np.ndarray | None:
     h, w = gray.shape[:2]
     border = 25
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
     ph, pw = padded.shape[:2]
 
-    for low, high in [(30, 90), (50, 150), (75, 200), (25, 75)]:
+    if canny_low is not None and canny_high is not None:
+        threshold_pairs = [(canny_low, canny_high)]
+    else:
+        threshold_pairs = [(30, 90), (50, 150), (75, 200), (25, 75)]
+
+    for low, high in threshold_pairs:
         edges = cv2.Canny(padded, low, high)
 
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
@@ -801,12 +810,54 @@ def _hough_lines(gray: np.ndarray) -> np.ndarray | None:
 
 
 # ---------------------------------------------------------------------------
+# 安全网回退：所有策略失败时，用最简单的 Canny + 最大四边形兜底
+# ---------------------------------------------------------------------------
+
+def _fallback_detect(gray: np.ndarray, min_area: float,
+                     w: int, h: int) -> np.ndarray | None:
+    """简单 Canny + 最大凸四边形检测，放宽评分要求作为最后兜底。"""
+    border = 25
+    padded = cv2.copyMakeBorder(gray, border, border, border, border,
+                                 cv2.BORDER_CONSTANT, value=0)
+    low, high = auto_canny(padded)
+    edges = cv2.Canny(padded, low, high)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(edges, kernel, iterations=2)
+    contours = _find_contours(dilated)
+    if not contours:
+        return None
+
+    for cnt in _sort_by_area(contours)[:10]:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        for eps in (0.01, 0.02, 0.04, 0.06, 0.10):
+            approx = cv2.approxPolyDP(cnt, eps * peri, True)
+            quad = _extract_quad(approx)
+            if quad is None:
+                continue
+            if not cv2.isContourConvex(quad.reshape(4, 1, 2)):
+                continue
+            quad_adj = quad - border
+            quad_adj[:, 0] = np.clip(quad_adj[:, 0], 0, w - 1)
+            quad_adj[:, 1] = np.clip(quad_adj[:, 1], 0, h - 1)
+            s = _score_quad(quad_adj, w, h)
+            if s > -500:
+                return quad_adj
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
 def find_document_contour(image: np.ndarray,
                           edges: np.ndarray | None = None,
-                          bgr: np.ndarray | None = None) -> np.ndarray | None:
+                          bgr: np.ndarray | None = None,
+                          canny_low: int | None = None,
+                          canny_high: int | None = None) -> np.ndarray | None:
     """多策略文档角点检测。
 
     按顺序尝试：亮度区域 → 多参数 Canny → 自适应阈值 → Sobel →
@@ -821,11 +872,11 @@ def find_document_contour(image: np.ndarray,
         ("radial",       lambda: _radial_search(gray, bgr_input, min_area)),
         ("sobel_fixed",  lambda: _sobel_fixed_edge(bgr_input, min_area) if bgr_input is not None else None),
         ("bright",       lambda: _find_by_bright_region(gray, min_area)),
-        ("canny",        lambda: _canny_sweep(gray, min_area)),
+        ("canny",        lambda: _canny_sweep(gray, min_area, canny_low, canny_high)),
         ("adaptive",     lambda: _adaptive_threshold(gray, min_area)),
         ("sobel",        lambda: _sobel_gradient(gray, min_area)),
         ("color",        lambda: _color_segmentation(bgr_input, min_area) if bgr_input is not None else None),
-        ("hough",        lambda: _hough_lines(gray)),
+        ("hough",        lambda: _hough_lines(gray, canny_low, canny_high)),
     ]
 
     best_quad, best_score = None, -9999
@@ -839,8 +890,13 @@ def find_document_contour(image: np.ndarray,
                 if s > best_score:
                     best_score = s
                     best_quad = quad
+                    if s > 70:
+                        break
         except Exception:
             continue
+
+    if best_quad is None:
+        best_quad = _fallback_detect(gray, min_area, w, h)
 
     return best_quad
 
@@ -859,3 +915,46 @@ def order_corners(corners: np.ndarray) -> np.ndarray:
     rect[1] = corners[np.argmin(diff)]
     rect[3] = corners[np.argmax(diff)]
     return rect
+
+
+def draw_document_contour(image: np.ndarray, corners: np.ndarray,
+                          title: str = "Document Detection") -> np.ndarray:
+    """在图像上绘制检测到的文档轮廓和角点，用于调试和可视化。
+
+    返回一份带标注的副本，不修改原图。
+    """
+    out = image.copy()
+    if len(out.shape) == 2:
+        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+
+    pts = corners.reshape(1, 4, 2).astype(np.int32)
+    cv2.polylines(out, [pts], True, (0, 255, 0), 3)
+
+    labels = ["TL", "TR", "BR", "BL"]
+    for i, (x, y) in enumerate(corners.astype(np.int32)):
+        cv2.circle(out, (x, y), 8, (255, 0, 0), cv2.FILLED)
+        cv2.putText(out, labels[i], (x + 12, y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    return out
+
+
+def draw_corners_on_canny(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    """在 Canny 边缘图上叠加检测到的角点和四边形，用于调试中间过程。
+
+    返回 BGR 彩色图像，黑色背景 + 白色边缘 + 绿色四边形 + 蓝色角点。
+    """
+    low, high = auto_canny(gray)
+    edges = cv2.Canny(gray, low, high)
+    out = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+
+    pts = corners.reshape(1, 4, 2).astype(np.int32)
+    cv2.polylines(out, [pts], True, (0, 255, 0), 2)
+
+    labels = ["TL", "TR", "BR", "BL"]
+    for i, (x, y) in enumerate(corners.astype(np.int32)):
+        cv2.circle(out, (x, y), 6, (255, 0, 0), cv2.FILLED)
+        cv2.putText(out, labels[i], (x + 10, y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+    return out
