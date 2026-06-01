@@ -11,13 +11,20 @@ class DocScanner:
     def __init__(self, canny_low: int | None = None, canny_high: int | None = None,
                  clahe: bool = True, sharpen: bool = True,
                  binarize: bool = False, binarize_method: str = "otsu",
-                 output_dir: str | Path | None = None):
+                 binarize_block_size: int | None = None,
+                 binarize_c: int | None = None,
+                 output_dir: str | Path | None = None,
+                 denoise: bool = True, denoise_kernel: int | None = None):
         self.canny_low = canny_low
         self.canny_high = canny_high
         self.do_clahe = clahe
         self.do_sharpen = sharpen
         self.do_binarize = binarize
         self.binarize_method = binarize_method
+        self.binarize_block_size = binarize_block_size
+        self.binarize_c = binarize_c
+        self.denoise = denoise
+        self.denoise_kernel = denoise_kernel
         self.output_dir = Path(output_dir) if output_dir else None
 
     def scan_image(self, image: np.ndarray) -> dict:
@@ -58,8 +65,8 @@ class DocScanner:
         ordered = detection.order_corners(best_corners)
         canny_debug = detection.draw_corners_on_canny(gray_raw, ordered)
         annotated = detection.draw_document_contour(original, ordered)
-        warped = transform.perspective_transform(original, ordered)
-        warped = transform.pad_to_a4(warped)
+        warped_raw = transform.perspective_transform(original, ordered)  # 原始尺寸
+        warped = transform.pad_to_a4(warped_raw)                        # A4 画布版（显示用）
 
         enhanced = enhance.enhance(
             warped,
@@ -67,6 +74,23 @@ class DocScanner:
             do_sharpen=self.do_sharpen,
             do_binarize=self.do_binarize,
             binarize_method=self.binarize_method,
+            binarize_block_size=self.binarize_block_size,
+            binarize_c=self.binarize_c,
+            denoise=self.denoise,
+            denoise_kernel=self.denoise_kernel,
+        )
+
+        # 原始尺寸版本（PDF 导出用）
+        enhanced_raw = enhance.enhance(
+            warped_raw,
+            do_clahe=self.do_clahe,
+            do_sharpen=self.do_sharpen,
+            do_binarize=self.do_binarize,
+            binarize_method=self.binarize_method,
+            binarize_block_size=self.binarize_block_size,
+            binarize_c=self.binarize_c,
+            denoise=self.denoise,
+            denoise_kernel=self.denoise_kernel,
         )
 
         return {
@@ -77,6 +101,8 @@ class DocScanner:
             "canny_debug": canny_debug,
             "annotated": annotated,
             "warped": warped,
+            "warped_raw": warped_raw,
+            "final_raw": enhanced_raw.get("final", warped_raw),
             **enhanced,
         }
 

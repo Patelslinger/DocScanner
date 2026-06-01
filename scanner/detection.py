@@ -882,6 +882,7 @@ def find_document_contour(image: np.ndarray,
     按顺序尝试：亮度区域 → 多参数 Canny → 自适应阈值 → Sobel →
     颜色分割 → Hough 直线。返回 (4, 2) 的角点数组，或 None。
     """
+    np.random.seed(12)  # 固定随机种子，确保 RANSAC 结果可重复
     gray = image if len(image.shape) == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     bgr_input = bgr if bgr is not None else (image if len(image.shape) == 3 else None)
     h, w = gray.shape[:2]

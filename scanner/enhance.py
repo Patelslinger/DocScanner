@@ -24,12 +24,29 @@ def sharpen(image: np.ndarray, strength: float | None = None) -> np.ndarray:
     return cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
 
 
-def binarize(image: np.ndarray, method: str = "otsu", block_size: int = 11, c: int = 2) -> np.ndarray:
+def _denoise_binary(binary: np.ndarray, kernel_size: int | None = None) -> np.ndarray:
+    """二值图形态学去噪：开运算去白噪点 + 闭运算填小黑孔。"""
+    if kernel_size is None:
+        kernel_size = _cfg.binarize.denoise_kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    denoised = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
+    return denoised
+
+
+def binarize(image: np.ndarray, method: str = "otsu",
+             block_size: int | None = None, c: int | None = None) -> np.ndarray:
     gray = image if len(image.shape) == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     if method == "otsu":
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     elif method == "adaptive":
+        if block_size is None:
+            block_size = _cfg.binarize.adaptive_block_size
+        if c is None:
+            c = _cfg.binarize.adaptive_c
+        if block_size % 2 == 0:
+            block_size += 1
         binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                        cv2.THRESH_BINARY, block_size, c)
     else:
@@ -39,19 +56,39 @@ def binarize(image: np.ndarray, method: str = "otsu", block_size: int = 11, c: i
 
 
 def enhance(image: np.ndarray, do_clahe: bool = True, do_sharpen: bool = True,
-            do_binarize: bool = False, binarize_method: str = "otsu") -> dict[str, np.ndarray]:
+            do_binarize: bool = False, binarize_method: str = "otsu",
+            binarize_block_size: int | None = None,
+            binarize_c: int | None = None,
+            denoise: bool = True,
+            denoise_kernel: int | None = None) -> dict[str, np.ndarray]:
     results = {"original": image}
 
     img = image.copy()
-    if do_clahe:
+    # 勾选 CLAHE 且勾选二值化 + clahe_before_binarize 时，先 CLAHE 再二值化
+    clahe_before = do_clahe and do_binarize and _cfg.binarize.clahe_before_binarize
+
+    if do_clahe and not clahe_before:
         img = clahe(img)
         results["clahe"] = img
     if do_sharpen:
         img = sharpen(img)
         results["sharpened"] = img
     if do_binarize:
-        binary = binarize(img, method=binarize_method)
+        if clahe_before:
+            # 对裁剪后的图做 CLAHE 再二值化，抑制阴影
+            clahe_img = clahe(image.copy())
+            binary = binarize(clahe_img, method=binarize_method,
+                              block_size=binarize_block_size, c=binarize_c)
+            results["clahe"] = clahe_img
+        else:
+            binary = binarize(img, method=binarize_method,
+                              block_size=binarize_block_size, c=binarize_c)
         results["binary"] = binary
+
+        # 二值化后去噪
+        if denoise:
+            binary = _denoise_binary(binary, kernel_size=denoise_kernel)
+            results["binary_denoised"] = binary
 
     results["final"] = binary if do_binarize else img
     return results

@@ -345,6 +345,21 @@ class TransformConfig:
 
 
 # ---------------------------------------------------------------------------
+# 二值化 — 自适应阈值参数与阴影抑制
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BinarizeConfig:
+    """二值化参数（针对阴影、褶皱等不均匀光照）"""
+
+    adaptive_block_size: int = 41       # Adaptive 块大小 (px)，越大越考虑全局，越小越敏感
+    adaptive_c: int = 2                 # Adaptive C 值，从局部均值减去的常数，越大二值化越苛刻
+    clahe_before_binarize: bool = True  # 二值化前先做 CLAHE 均衡亮度，对阴影褶皱有帮助
+    denoise: bool = True                # 二值化后做形态学去噪（开运算去白点 + 闭运算填黑孔）
+    denoise_kernel: int = 3             # 去噪核大小 (px)，越大去噪越强，但也会抹掉细笔画
+
+
+# ---------------------------------------------------------------------------
 # 预处理 — 输入图像的初始预处理参数
 # ---------------------------------------------------------------------------
 
@@ -383,6 +398,7 @@ class ScannerConfig:
     enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
     transform: TransformConfig = field(default_factory=TransformConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
+    binarize: BinarizeConfig = field(default_factory=BinarizeConfig)
 
 
 # 全局默认配置实例

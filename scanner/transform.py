@@ -32,9 +32,18 @@ def perspective_transform(image: np.ndarray, corners: np.ndarray,
 
 
 def pad_to_a4(image: np.ndarray) -> np.ndarray:
-    """将矫正后的图像居中放置到 A4 比例 (210:297) 的白色画布上."""
+    """将矫正后的图像居中放置到 A4 比例 (210:297 或 297:210) 的白色画布上.
+
+    根据图像的实际方向匹配对应的 A4 方向：横图用横版 A4，竖图用竖版 A4。
+    """
     h, w = image.shape[:2]
-    target_ratio = _cfg.transform.a4_width / _cfg.transform.a4_height
+    a4_w, a4_h = _cfg.transform.a4_width, _cfg.transform.a4_height
+
+    # 横图用横版 A4，竖图用竖版 A4
+    if w > h:
+        target_ratio = a4_h / a4_w  # 横版 297/210 ≈ 1.414
+    else:
+        target_ratio = a4_w / a4_h  # 竖版 210/297 ≈ 0.707
 
     current_ratio = w / h
     if abs(current_ratio - target_ratio) < _cfg.transform.ratio_tolerance:
