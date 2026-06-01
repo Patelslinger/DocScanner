@@ -138,7 +138,7 @@ class RefineConfig:
 class RansacQuadConfig:
     """RANSAC 直接拟合四边形参数（备用策略）"""
 
-    iterations: int = 60              # RANSAC 迭代次数
+    iterations: int = 70              # RANSAC 迭代次数
     min_pt_distance: float = 10       # 最小点间距 (px)：两点距离小于此值 → 跳过
     outlier_margin: int = 50          # 交点可超出图像边缘的像素数，允许边线延伸到图外再求交点
 
@@ -151,11 +151,11 @@ class RansacQuadConfig:
 class SobelFixedConfig:
     """Sobel 固定阈值边缘检测参数"""
 
-    sobel_scale: float = 1.5          # Sobel 响应放大系数：梯度幅值 * 此值后再阈值化
+    sobel_scale: float = 1.8          # Sobel 响应放大系数：梯度幅值 * 此值后再阈值化
     thresholds: tuple[int, ...] = (30, 40, 50, 60, 70)
     """二值化阈值列表：多个阈值分别尝试，取最佳结果"""
     blur_kernel: int = 3              # 高斯模糊核大小 (px)
-    dilate_iter: int = 2              # 膨胀迭代次数：连接断开的边缘
+    dilate_iter: int = 6              # 膨胀迭代次数：连接断开的边缘
     max_contours: int = 5             # 最多保留的候选轮廓数
 
 
@@ -176,9 +176,9 @@ class BrightConfig:
     percentiles: tuple[int, ...] = (55, 60, 65, 70, 75)
     """百分位数列表：取图像第 N 百分位数作为阈值"""
 
-    morph_kernel: int = 7             # 形态学操作核大小 (px)
+    morph_kernel: int = 5             # 形态学操作核大小 (px)
     morph_close_iter: int = 3         # 闭运算迭代次数：填充区域内部孔洞
-    morph_open_iter: int = 1          # 开运算迭代次数：去除小噪点
+    morph_open_iter: int = 7          # 开运算迭代次数：去除小噪点
     max_contours: int = 3             # 最多保留的候选轮廓数
 
 
@@ -255,9 +255,9 @@ class ColorSegConfig:
         {"s_max": 40, "v_min": 150},    # 低饱和 + 更高亮 → 更严格的白色纸张
         {"s_max": 35},                   # 仅限制低饱和
         {"l_min": 170},                  # LAB 高亮度 → 白色区域
-        {"s_max": 25, "v_min": 100},    # 更宽松的白纸阈值
+        {"s_max": 25, "v_min": 80},    # 更宽松的白纸阈值
     )
-    morph_kernel: int = 7             # 形态学操作核大小 (px)
+    morph_kernel: int = 5             # 形态学操作核大小 (px)
     morph_close_iter: int = 4         # 闭运算迭代次数
     morph_open_iter: int = 2          # 开运算迭代次数
     max_contours: int = 3             # 最多保留的候选轮廓数
