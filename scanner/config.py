@@ -1,3 +1,41 @@
+"""
+配置文件 —— 集中管理所有算法模块的可调参数
+=============================================
+
+采用 @dataclass + 嵌套聚合模式，所有参数集中定义在 ScannerConfig 这个顶层配置类中。
+各模块通过 `from .config import default_config as _cfg` 引用，
+例如 `_cfg.scoring.area_min_ratio`、`_cfg.detection.border_size`。
+
+这样的设计便于：
+1. 参数调优时只需改这一个文件，无需深入各算法代码
+2. 可序列化保存多组参数配置（如"办公文档模式"、"名片模式"）
+3. 所有参数有默认值和注释说明，降低使用门槛
+
+分层结构:
+ScannerConfig (顶层)
+├── scoring        — 候选四边形评分
+├── extract        — 轮廓近似为四边形
+├── radial         — 射线搜索边界点
+├── ransac         — RANSAC 直线拟合
+├── quadrant       — 象限分组 + 线拟合
+├── refine         — 角点精修
+├── ransac_quad    — RANSAC 四边形拟合（备用）
+├── sobel_fixed    — Sobel 固定阈值
+├── bright         — 亮度区域分割
+├── canny_sweep    — Canny 多参数扫描
+├── adaptive       — 自适应阈值
+├── sobel_grad     — Sobel 梯度
+├── color_seg      — 颜色分割
+├── hough          — Hough 直线检测
+├── fallback       — 安全网回退
+├── detection      — 检测主流程
+├── pipeline       — 预处理管线
+├── enhance        — 图像增强
+├── transform      — 透视变换
+├── preprocess     — 图像预处理
+└── binarize       — 二值化
+"""
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 

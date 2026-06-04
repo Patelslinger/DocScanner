@@ -1,6 +1,27 @@
 """
 窗口化文档扫描器 — Tkinter 桌面应用
+=====================================
+
+提供图形界面操作方式，包括：
+- 单张图片扫描（打开文件 → 调节参数 → 点击扫描）
+- 批量文件夹扫描
+- 实时参数调节（Canny 阈值、CLAHE/锐化/二值化开关等）
+- 多 Tab 展示各阶段结果（原图 / 角点标注 / Canny调试 / 透视矫正 / 最终输出 / 二值图）
+- PDF 导出
+
+启动方式:  python app_gui.py
+
+左侧面板功能:
+    文件操作 — 打开图片 / 打开文件夹 / 保存图像 / 导出 PDF
+    Canny 调试图开关
+    批量导航（批量模式下前后翻阅）
+    Canny 低/高阈值滑块
+    增强参数 — CLAHE / 锐化 / 二值化方法及参数 / 去噪
+
+右侧面板功能:
+    六标签页分别展示管线各阶段输出
 """
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -14,6 +35,11 @@ from scanner import io_utils
 
 class DocScannerApp:
     def __init__(self):
+        """初始化 GUI 应用。
+
+        设置窗口、状态变量（模式、图片路径、扫描参数）、
+        构建 UI 布局、创建 DocScanner 实例。
+        """
         self.root = tk.Tk()
         self.root.title("智能文档扫描器")
         self.root.geometry("1280x800")
@@ -53,6 +79,12 @@ class DocScannerApp:
     # ==================================================================
 
     def _build_ui(self):
+        """构建 GUI 主界面布局。
+
+        采用 PanedWindow 左右分区：
+        - 左侧: 控制面板（可滚动），含文件操作、参数调节、运行按钮
+        - 右侧: Notebook 多标签显示区，展示各阶段图像结果
+        """
         # 主布局：左侧控制面板 + 右侧显示区
         main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -70,7 +102,16 @@ class DocScannerApp:
         self._build_display_panel(right_frame)
 
     def _build_control_panel(self, parent):
-        pad = {"padx": 10, "pady": 4, "anchor": tk.W}
+        """构建左侧控制面板。
+
+        使用 Canvas + Scrollbar 实现可滚动区域，包含：
+        - 文件操作（打开/保存/PDF 导出）
+        - 显示选项（Canny 调试开关）
+        - 批量导航
+        - Canny 阈值滑块
+        - 增强参数（CLAHE/锐化/二值化/去噪）
+        - 开始扫描按钮 + 状态栏
+        """
         pad_no_anchor = {"padx": 10, "pady": 4, "fill": tk.X}
         col_pad = {"padx": 3, "pady": 2}
 
@@ -193,6 +234,16 @@ class DocScannerApp:
             fill=tk.X, pady=2)
 
     def _build_display_panel(self, parent):
+        """构建右侧显示面板（Notebook 多标签页）。
+
+        6 个标签页分别展示管线各阶段结果：
+        1. 原图 — 加载的原始图像
+        2. 角点标注 — 绿色四边形 + 蓝色角点
+        3. Canny 调试 — Canny 边缘图上叠加四边形
+        4. 透视矫正 — 透视变换后的文档正视图
+        5. 最终输出 — 增强后的最终结果
+        6. 二值图 — 二值化结果（如有）
+        """
         # 标签栏切换不同视图
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -223,6 +274,14 @@ class DocScannerApp:
     # ==================================================================
 
     def _open_image(self):
+        """打开单张图片文件。
+
+        通过文件对话框选择图片，加载后：
+        - 切换到单张模式（single）
+        - 重置之前的结果缓存
+        - 在原图 Tab 中显示图片
+        - 清除其他 Tab 的缓存图像
+        """
         path = filedialog.askopenfilename(
             title="选择图片",
             filetypes=[("图片文件", "*.jpg *.jpeg *.png *.bmp *.tiff"), ("所有文件", "*.*")],
@@ -251,6 +310,12 @@ class DocScannerApp:
         self._clear_all_tabs_except("original")
 
     def _run_scan(self):
+        """执行单张图片扫描（主入口）。
+
+        读取当前面板上的所有参数，构建 DocScanner 实例，
+        调用 scan_image 执行完整扫描管线。
+        扫描成功后展示各阶段结果图到对应 Tab。
+        """
         if self.mode == "batch":
             self._run_batch_scan()
             return
@@ -301,6 +366,12 @@ class DocScannerApp:
             self.status_var.set("✅ 检测成功")
 
     def _run_batch_scan(self):
+        """批量扫描文件夹中所有图片。
+
+        遍历 image_paths 列表，每张图片依次执行扫描。
+        结束后默认显示第一张成功结果。
+        更新导航栏显示当前索引/总数。
+        """
         if not self.image_paths:
             messagebox.showwarning("提示", "请先打开一个文件夹")
             return
@@ -358,6 +429,11 @@ class DocScannerApp:
         self.nav_frame.pack(fill=tk.X, pady=2, padx=1)
 
     def _save_result(self):
+        """保存单张扫描结果到磁盘。
+
+        将缓存中的各阶段结果图（warped/annotated/canny_debug/final/binary）
+        保存到用户选择的目录。
+        """
         if self.mode == "batch" and self.batch_results:
             self._save_batch_results()
             return
@@ -396,6 +472,10 @@ class DocScannerApp:
             messagebox.showwarning("提示", "没有可保存的图像数据")
 
     def _save_batch_results(self):
+        """批量保存所有扫描成功的结果图到目录。
+
+        每张成功图片保存 final/warped/annotated 三个版本。
+        """
         dir_path = filedialog.askdirectory(title="选择保存目录", initialdir="./output")
         if not dir_path:
             return
@@ -427,6 +507,15 @@ class DocScannerApp:
     # ==================================================================
 
     def _show_image_on_tab(self, tab_key: str, bgr_img: np.ndarray):
+        """在指定 Tab 上显示图像。
+
+        BGR → RGB 转换 → PIL 缩放（保持比例，不超过标签尺寸）→ ImageTk 显示。
+        缩放不会放大图像（仅缩小到适应区域）。
+
+        Args:
+            tab_key: 标签页标识（"original"/"annotated"/"canny_debug"/"warped"/"final"/"binary"）
+            bgr_img: BGR 格式的 OpenCV 图像
+        """
         if bgr_img is None or bgr_img.size == 0:
             return
         label = self.tabs[tab_key]["label"]
@@ -451,6 +540,11 @@ class DocScannerApp:
         label.image = tk_img  # 防止被 GC
 
     def _clear_all_tabs_except(self, keep_key: str):
+        """清除指定 Tab 之外的所有 Tab 图像。
+
+        Args:
+            keep_key: 保留不清除的 Tab 标识
+        """
         for key, tab in self.tabs.items():
             if key != keep_key:
                 tab["label"].config(image="")
@@ -461,6 +555,11 @@ class DocScannerApp:
     # ==================================================================
 
     def _open_folder(self):
+        """打开一个图片文件夹，进入批量模式。
+
+        使用 io_utils.collect_images 收集目录中所有支持的图片，
+        加载第一张到原图 Tab，等待用户点击"开始扫描"执行批量处理。
+        """
         dir_path = filedialog.askdirectory(title="选择图片文件夹")
         if not dir_path:
             return
@@ -482,7 +581,11 @@ class DocScannerApp:
         self.status_var.set(f"📁 已加载文件夹: {Path(dir_path).name} ({len(paths)} 张图片)")
 
     def _load_batch_image(self, index: int):
-        """加载批量模式下的某张图片到预览（不扫描）"""
+        """加载批量模式下指定索引的图片到预览（仅加载，不扫描）。
+
+        Args:
+            index: 图片在 image_paths 列表中的索引
+        """
         if not self.image_paths or index < 0 or index >= len(self.image_paths):
             return
         self.current_index = index
@@ -499,6 +602,7 @@ class DocScannerApp:
         self.status_var.set(f"📁 [{index + 1}/{len(self.image_paths)}] {path.name}")
 
     def _navigate_prev(self):
+        """批量模式下切换到上一张图片的结果。"""
         if not self.batch_results:
             return
         idx = (self.current_index - 1) % len(self.batch_results)
@@ -506,6 +610,7 @@ class DocScannerApp:
         self._display_batch_result()
 
     def _navigate_next(self):
+        """批量模式下切换到下一张图片的结果。"""
         if not self.batch_results:
             return
         idx = (self.current_index + 1) % len(self.batch_results)
@@ -513,7 +618,12 @@ class DocScannerApp:
         self._display_batch_result()
 
     def _display_batch_result(self):
-        """显示批量模式下当前索引的扫描结果"""
+        """显示批量模式下当前索引的扫描结果。
+
+        如果扫描成功，与 _display_result 一样显示各阶段图；
+        如果扫描失败，至少显示原图。
+        同时更新导航标签和状态栏。
+        """
         idx = self.current_index
         if idx >= len(self.batch_results):
             return
@@ -543,7 +653,20 @@ class DocScannerApp:
         self.status_var.set(f"{'✅' if result['success'] else '❌'} [{idx + 1}/{total}] {name}")
 
     def _display_result(self, result: dict):
-        """展示单个扫描结果的各阶段图"""
+        """展示单个扫描结果的各阶段图到对应的 Tab。
+
+        按顺序显示：
+        - annotated: 角点标注图
+        - canny_debug: Canny 调试图
+        - warped: 透视矫正图
+        - final: 最终输出
+        - binary: 二值图（如有）
+
+        根据 show_debug 状态自动切换到 Canny 调试 Tab 或角点标注 Tab。
+
+        Args:
+            result: scan_image 返回的结果字典
+        """
         if "annotated" in result:
             self._show_image_on_tab("annotated", result["annotated"])
         if "canny_debug" in result:
@@ -562,7 +685,12 @@ class DocScannerApp:
             self.notebook.select(self.tabs["annotated"]["frame"])
 
     def _save_pdf(self):
-        """导出扫描结果为 PDF"""
+        """将扫描结果导出为 PDF 文件（单张模式）。
+
+        优先使用 final_raw（原始尺寸增强图），
+        其次用 final，最后用 warped。
+        先保存临时 JPG 文件，再用 img2pdf 转为 PDF，最后清理临时文件。
+        """
         if self.mode == "batch" and self.batch_results:
             self._save_batch_pdf()
             return
@@ -608,7 +736,11 @@ class DocScannerApp:
             messagebox.showerror("导出失败", str(e))
 
     def _save_batch_pdf(self):
-        """导出批量扫描结果为每个文档各自独立的 PDF"""
+        """批量导出扫描结果为 PDF（每个文档一个独立的 PDF 文件）。
+
+        遍历所有批量结果，扫描成功的每张图片生成对应的 PDF 文件，
+        文件名取自原始文件名。保存到用户选择的目录中。
+        """
         dir_path = filedialog.askdirectory(title="选择 PDF 保存目录", initialdir="./output")
         if not dir_path:
             return
@@ -659,6 +791,7 @@ class DocScannerApp:
     # ==================================================================
 
     def run(self):
+        """启动 GUI 应用主循环。"""
         self.root.mainloop()
 
 

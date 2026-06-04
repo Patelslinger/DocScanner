@@ -1,3 +1,23 @@
+"""
+命令行入口 — 智能文档扫描器 CLI
+==================================
+
+提供两个子命令:
+    scan <图片路径>    — 扫描单张图片
+    batch <目录路径>   — 批量扫描整个文件夹
+
+用法示例:
+    python main.py scan input/1.jpg -o ./output
+    python main.py batch input/ --binarize --pdf result.pdf
+    python main.py scan input/1.jpg --canny-low 50 --canny-high 150 --no-clahe
+
+增强选项:
+    --no-clahe      禁用 CLAHE 对比度增强
+    --no-sharpen    禁用锐化
+    --binarize      启用二值化（默认关闭）
+    --binarize-method otsu|adaptive  二值化方法
+"""
+
 import argparse
 from pathlib import Path
 
@@ -10,7 +30,7 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", help="子命令")
 
-    # ---- scan ----
+    # ---- scan 子命令：扫描单张图片 ----
     scan_parser = sub.add_parser("scan", help="扫描单张图片")
     scan_parser.add_argument("input", type=str, help="输入图片路径")
     scan_parser.add_argument("-o", "--output-dir", type=str, default="./output",
@@ -25,7 +45,7 @@ def main():
     scan_parser.add_argument("--binarize-method", choices=["otsu", "adaptive"],
                              default="otsu", help="二值化方法 (default: otsu)")
 
-    # ---- batch ----
+    # ---- batch 子命令：批量扫描 ----
     batch_parser = sub.add_parser("batch", help="批量扫描目录中的所有图片")
     batch_parser.add_argument("input_dir", type=str, help="输入目录")
     batch_parser.add_argument("-o", "--output-dir", type=str, default="./output",

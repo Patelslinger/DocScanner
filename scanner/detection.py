@@ -1,3 +1,31 @@
+"""
+文档角点检测模块 — 8 种级联策略 + 四边形评分系统
+====================================================
+
+这是项目最核心的模块，负责从图像中定位文档的四个角点。
+因为单一的边缘检测方法无法适应所有场景（光照、背景、纸张颜色等），
+所以设计了 8 种互补的检测策略按优先级级联执行，每种子策略返回候选四边形，
+由评分系统选出最优结果。
+
+评分维度（见 _score_quad）:
+- 面积占比（纸张应占画面一定比例）
+- 对边平行度（透视变形后对边仍大致平行）
+- 内角合理性（四个角应在合理角度范围）
+- 矩形度（轮廓面积/外接矩形面积）
+- 贴边惩罚（角点贴到图像边缘说明检测可能出错）
+
+策略执行顺序:
+1. 射线搜索（_radial_search）— 最优先，不依赖完整闭合边缘
+2. Sobel 固定阈值（_sobel_fixed_edge）
+3. 亮度区域分割（_find_by_bright_region）
+4. Canny 多参数扫描（_canny_sweep）
+5. 自适应阈值（_adaptive_threshold）
+6. Sobel 梯度（_sobel_gradient）
+7. 颜色分割（_color_segmentation）
+8. Hough 直线检测（_hough_lines）
+9. 安全网回退（_fallback_detect）
+"""
+
 import cv2
 import numpy as np
 
@@ -5,10 +33,23 @@ from .config import default_config as _cfg
 
 
 # ---------------------------------------------------------------------------
-# 基础工具
+# 基础工具 — Canny 阈值自动计算、轮廓提取、排序
 # ---------------------------------------------------------------------------
 
 def auto_canny(image: np.ndarray, sigma: float = 0.33) -> tuple[int, int]:
+    """基于图像中位亮度自动计算 Canny 双阈值。
+
+    算法：以图像中位数为基准，低阈值 = max(0, (1 - sigma) × 中位数)，
+    高阈值 = min(255, (1 + sigma) × 中位数)。
+    sigma 越小双阈值越窄，边缘越敏感。
+
+    Args:
+        image: 灰度图
+        sigma: 阈值缩放因子，默认 0.33
+
+    Returns:
+        (低阈值, 高阈值)
+    """
     median = np.median(image)
     low = int(max(0, (1.0 - sigma) * median))
     high = int(min(255, (1.0 + sigma) * median))
@@ -16,17 +57,43 @@ def auto_canny(image: np.ndarray, sigma: float = 0.33) -> tuple[int, int]:
 
 
 def canny_edge(image: np.ndarray, low: int | None = None, high: int | None = None) -> np.ndarray:
+    """执行 Canny 边缘检测，支持自动或手动阈值。
+
+    Args:
+        image: 灰度图
+        low: Canny 低阈值，None 则自动计算
+        high: Canny 高阈值，None 则自动计算
+
+    Returns:
+        边缘图（二值图，边缘为白）
+    """
     if low is None or high is None:
         low, high = auto_canny(image)
     return cv2.Canny(image, low, high)
 
 
 def _find_contours(edges: np.ndarray) -> list:
+    """从边缘二值图中查找所有外轮廓。
+
+    Args:
+        edges: Canny 或其它边缘检测输出的二值图
+
+    Returns:
+        轮廓列表，每个轮廓是 N×1×2 的 ndarray
+    """
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return contours
 
 
 def _sort_by_area(contours: list) -> list:
+    """按轮廓面积从大到小排序。
+
+    Args:
+        contours: 轮廓列表
+
+    Returns:
+        降序排列的轮廓列表
+    """
     return sorted(contours, key=cv2.contourArea, reverse=True)
 
 
@@ -35,6 +102,20 @@ def _sort_by_area(contours: list) -> list:
 # ---------------------------------------------------------------------------
 
 def _extract_quad(approx: np.ndarray) -> np.ndarray | None:
+    """从多边形近似结果中提取四边形（4 个顶点）。
+
+    三种情况处理：
+    1. 已经是四边形（len==4）→ 直接返回
+    2. 多于 4 个点 → 取凸包，尝试多组 eps 参数逼近为四边形；
+       如果都不行，用最小外接矩形（minAreaRect）兜底
+    3. 少于 4 个点 → 无解，返回 None
+
+    Args:
+        approx: 多边形近似结果
+
+    Returns:
+        (4, 2) 的角点数组，或 None
+    """
     if len(approx) == 4:
         return approx.reshape(4, 2).astype(np.float32)
 
@@ -54,7 +135,29 @@ def _extract_quad(approx: np.ndarray) -> np.ndarray | None:
 
 
 def _score_quad(quad: np.ndarray, w: int, h: int) -> float:
-    """给四边形打分，越高越好。"""
+    """对候选四边形进行综合评分，分数越高说明越可能是纸张边界。
+
+    评分维度（总分无上限，通常 0~100 之间）:
+    1. 面积占比：面积 / 图像总面积，完美范围 20%~93%
+    2. 对边平行度：上下边、左右边的长度比，越接近 1 越好
+    3. 内角合理性：四个内角应在 45°~135° 之间
+    4. 矩形度：轮廓面积 / 外接矩形面积，纸张通常接近矩形
+    5. 贴边惩罚：角点贴到图像边缘说明可能检测错误
+
+    拒绝条件（返回极低分）:
+    - 最小边长 < 10px
+    - 面积占比 < 6% 或 > 98%
+    - 贴边角点 ≥ 3 个
+    - 矩形度 < 0.5
+
+    Args:
+        quad: (4, 2) 的角点数组
+        w: 图像宽度
+        h: 图像高度
+
+    Returns:
+        综合评分（越高越好，负分表示该四边形不可用）
+    """
     quad = order_corners(quad)
     tl, tr, br, bl = quad
 
@@ -136,7 +239,28 @@ def _score_quad(quad: np.ndarray, w: int, h: int) -> float:
 
 def _radial_search(gray: np.ndarray, bgr: np.ndarray | None,
                    min_area: float) -> np.ndarray | None:
-    """从图像中心向外发射射线，沿每条射线找梯度最大处作为纸张边界。"""
+    """[策略 0 — 射线搜索] 从图像中心发射射线，沿梯度最大处找边界。
+
+    这是最优先的策略，因为它不依赖完整的闭合边缘。
+    即使纸张边缘有断裂、阴影干扰，射线仍能找到梯度峰值。
+
+    步骤：
+    1. 高斯模糊降噪
+    2. Sobel 计算梯度幅值图
+    3. 从图像中心沿 360°（步长 1°）发射线
+    4. 每条射线上找梯度响应最大的点作为边界候选
+    5. 中位距离过滤离群点
+    6. 象限分组 → RANSAC 直线拟合 → 求交点得到四边形
+    7. 精修角点 → 评分
+
+    Args:
+        gray: 灰度图
+        bgr: BGR 原图（仅用于传递给 refine）
+        min_area: 最小面积阈值
+
+    Returns:
+        (4, 2) 的角点数组，或 None
+    """
     h, w = gray.shape[:2]
     cy, cx = h // 2, w // 2
 
@@ -200,7 +324,26 @@ def _radial_search(gray: np.ndarray, bgr: np.ndarray | None,
 
 def _quadrant_fit_quad(points: np.ndarray, cx: float, cy: float,
                         w: int, h: int) -> np.ndarray | None:
-    """将边界点按相对中心的方位分 4 组，每组拟合一条边，求交点。"""
+    """将边界点按相对中心的方位分 4 组，每组 RANSAC 拟合一条边，求交点得到四边形。
+
+    分组逻辑（角度以图像中心为原点）:
+    - right:  角度 [315°, 360°) ∪ [0°, 45°)
+    - bottom: 角度 [45°, 135°)
+    - left:   角度 [135°, 225°)
+    - top:    角度 [225°, 315°)
+
+    如果某组点数不足 5 个，跳过该边的拟合；
+    如果至少 3 组有数据，用迭代重分配精修后求交点；
+    如果只有 3 组，用最后一组的平行偏移补第 4 边。
+
+    Args:
+        points: 边界点集，形状 (N, 2)
+        cx, cy: 图像中心坐标
+        w, h: 图像尺寸
+
+    Returns:
+        (4, 2) 的角点数组，或 None
+    """
     dx = points[:, 0] - cx
     dy = points[:, 1] - cy
     a = _cfg.quadrant.angles
@@ -278,7 +421,18 @@ def _quadrant_fit_quad(points: np.ndarray, cx: float, cy: float,
 
 
 def _ransac_line(points: np.ndarray) -> tuple | None:
-    """对一组点做 RANSAC 直线拟合，返回 (a, b, c) 使得 ax+by+c=0。"""
+    """对一组点做 RANSAC 直线拟合，返回 (a, b, c) 使得 ax + by + c = 0。
+
+    随机采样 2 个点确定直线，计算所有点到直线的距离，
+    统计 inlier（距离 < threshold）数量。
+    迭代 N 次取 inlier 最多的直线。
+
+    Args:
+        points: 点集，形状 (N, 2)
+
+    Returns:
+        (a, b, c) 直线系数，归一化使得 √(a²+b²) = 1，或 None
+    """
     if len(points) < _cfg.ransac.min_points:
         return None
     best_line = None
@@ -305,7 +459,19 @@ def _ransac_line(points: np.ndarray) -> tuple | None:
 
 def _iterative_line_fit(lines: dict, points: np.ndarray,
                          iterations: int = 3) -> dict:
-    """迭代精修：将每个点分配到最近的线，重新拟合，重复 N 次。"""
+    """迭代精修边线：将每个点重新分配给最近的边，再重新拟合，重复 N 次。
+
+    初始的象限分组可能把边界点分错组（比如右上角的点被分到 'top' 组），
+    迭代过程逐步纠正，让每个点归属到离它最近的边。
+
+    Args:
+        lines: {name: (a, b, c)} 的字典，name 为 'top'/'right'/'bottom'/'left'
+        points: 所有边界点
+        iterations: 迭代轮数
+
+    Returns:
+        精修后的边线字典
+    """
     if len(lines) < 2:
         return lines
     for _ in range(iterations):
@@ -340,7 +506,20 @@ def _iterative_line_fit(lines: dict, points: np.ndarray,
 
 def _refine_corners_on_edges(quad: np.ndarray, gray: np.ndarray,
                               w: int, h: int) -> np.ndarray:
-    """沿每条边采样多个点，分别搜索法线方向最强梯度，微调角点位置。"""
+    """沿四边形边采样，在法线方向搜索最强梯度来精修角点位置。
+
+    第一次逼近得到的角点可能不够精确，因为多边形的顶点不一定在真实的纸张边界上。
+    这个方法沿每条边采样多个点，在每个点处沿法线方向搜索 Sobel 梯度最强的位置，
+    用中位偏移量平移整条边，使角点更贴合真正的纸张边缘。
+
+    Args:
+        quad: (4, 2) 的角点数组
+        gray: 灰度图
+        w, h: 图像尺寸
+
+    Returns:
+        精修后的角点数组 (4, 2)
+    """
     gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
     grad_mag = np.sqrt(gx ** 2 + gy ** 2)
@@ -380,7 +559,19 @@ def _refine_corners_on_edges(quad: np.ndarray, gray: np.ndarray,
 
 
 def _ransac_fit_quad(points: np.ndarray, w: int, h: int) -> np.ndarray | None:
-    """纯 RANSAC 同时拟合 4 条直线，计算交点得到四边形角点（备用）。"""
+    """[备用] 纯 RANSAC 同时拟合 4 条直线，求交点得四边形。
+
+    与 _quadrant_fit_quad 不同，这个方法不依赖象限分组，
+    直接从点集中随机采样 4 对点拟合 4 条直线，然后两两求交点。
+    因为搜索空间大，迭代次数多，作为备用方案。
+
+    Args:
+        points: 边界点集
+        w, h: 图像尺寸
+
+    Returns:
+        (4, 2) 角点数组，或 None
+    """
     best_quad, best_score = None, -9999
     for _ in range(_cfg.ransac_quad.iterations):
         if len(points) < 8:
@@ -443,7 +634,26 @@ def _ransac_fit_quad(points: np.ndarray, w: int, h: int) -> np.ndarray | None:
 # ---------------------------------------------------------------------------
 
 def _sobel_fixed_edge(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
-    """Sobel X+Y 固定阈值边缘检测：先 BGR 模糊去噪，再灰度化 + Sobel。"""
+    """[策略 1 — Sobel 固定阈值] 先模糊去噪 → Sobel 求梯度 → 固定阈值二值化 → 找四边形。
+
+    与 Canny 相比，Sobel 固定阈值能保留更连续的边缘（因为不受 NMS 影响），
+    适合纸张边界模糊或不连续的场景。
+
+    步骤：
+    1. BGR 图加黑边 padding
+    2. 高斯模糊去噪
+    3. Sobel X + Sobel Y 分别计算后合并
+    4. 多组固定阈值尝试二值化
+    5. 膨胀连接断开的边缘
+    6. 找轮廓 → 多边形近似 → 四边形提取 → 评分
+
+    Args:
+        bgr: BGR 彩色图
+        min_area: 最小面积阈值
+
+    Returns:
+        (4, 2) 角点数组，或 None
+    """
     h, w = bgr.shape[:2]
     border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(bgr, border, border, border, border,
@@ -487,7 +697,24 @@ def _sobel_fixed_edge(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
 # 策略 2：亮度区域分割
 
 def _find_by_bright_region(gray: np.ndarray, min_area: float) -> np.ndarray | None:
-    """将纸张作为图像中最亮的连通区域来检测，使用中心参考阈值。"""
+    """[策略 2 — 亮度区域分割] 将纸张作为图像中最亮的区域来检测。
+
+    基于一个简单观察：文档纸张通常是画面中最亮且面积最大的均匀区域。
+
+    三种阈值策略依次尝试（任一种成功即返回）:
+    方法 A — 中心参考：取图像中心 ¼ 区域的亮度均值和标准差，按 mean - n*std 做阈值
+    方法 B — Otsu偏移：Otsu 全局阈值 ± 偏移量
+    方法 C — 百分位：取全图第 55/60/65/70/75 百分位作为阈值
+
+    每种阈值生成二值图 → 形态学闭运算（填孔）+ 开运算（去噪）→ 找轮廓 → 四边形提取
+
+    Args:
+        gray: 灰度图
+        min_area: 最小面积阈值
+
+    Returns:
+        (4, 2) 的角点数组，或 None
+    """
     h, w = gray.shape[:2]
 
     # 采样图像中心 1/4 区域作为纸张亮度参考
@@ -529,7 +756,25 @@ def _find_by_bright_region(gray: np.ndarray, min_area: float) -> np.ndarray | No
 
 def _bright_region_from_threshold(gray: np.ndarray, thresh_val: int,
                                    min_area: float, h: int, w: int) -> np.ndarray | None:
-    """给定阈值，从二值图中提取最大的连通区域并逼近四边形。"""
+    """给定阈值，从二值图中提取亮度区域并逼近四边形。
+
+    步骤：
+    1. 灰度图加 padding
+    2. 阈值二值化
+    3. 形态学闭运算（填孔）+ 开运算（去噪）
+    4. 找轮廓 → 按面积排序
+    5. 方式 A：轮廓直接逼近四边形
+    6. 方式 B：minAreaRect 最小外接矩形兜底
+
+    Args:
+        gray: 灰度图
+        thresh_val: 二值化阈值
+        min_area: 最小面积
+        h, w: 图像尺寸
+
+    Returns:
+        (4, 2) 角点数组，或 None
+    """
     border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
@@ -583,6 +828,22 @@ def _bright_region_from_threshold(gray: np.ndarray, thresh_val: int,
 def _canny_sweep(gray: np.ndarray, min_area: float,
                   canny_low: int | None = None,
                   canny_high: int | None = None) -> np.ndarray | None:
+    """[策略 3 — Canny 多参数扫描] 多组参数遍历 Canny 检测，取最佳四边形。
+
+    自动遍历 sigma/blur/dilate 参数组合，对每套参数做：
+    高斯模糊 → Canny → 膨胀 → 找轮廓 → 四边形提取 → 评分
+
+    保留所有组合中分数最高的四边形。
+
+    Args:
+        gray: 灰度图
+        min_area: 最小面积阈值
+        canny_low: 手动指定 Canny 低阈值（命令行参数传入）
+        canny_high: 手动指定 Canny 高阈值
+
+    Returns:
+        (4, 2) 角点数组，或 None
+    """
     h, w = gray.shape[:2]
     best_quad, best_score = None, -9999
 
@@ -635,6 +896,19 @@ def _canny_sweep(gray: np.ndarray, min_area: float,
 # ---------------------------------------------------------------------------
 
 def _adaptive_threshold(gray: np.ndarray, min_area: float) -> np.ndarray | None:
+    """[策略 4 — 自适应阈值] 局部自适应二值化 → 四边形提取。
+
+    对光照不均的场景特别有效（如部分区域有阴影）。
+    尝试多个 block size（41/61/81/111/151），每块独立计算阈值。
+    二值化后做形态学闭+开运算，然后提取四边形。
+
+    Args:
+        gray: 灰度图
+        min_area: 最小面积阈值
+
+    Returns:
+        (4, 2) 角点数组，或 None
+    """
     h, w = gray.shape[:2]
     border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
@@ -679,6 +953,18 @@ def _adaptive_threshold(gray: np.ndarray, min_area: float) -> np.ndarray | None:
 # ---------------------------------------------------------------------------
 
 def _sobel_gradient(gray: np.ndarray, min_area: float) -> np.ndarray | None:
+    """[策略 5 — Sobel 梯度] 直接对 Sobel 梯度幅值阈值化 → 四边形提取。
+
+    与 _sobel_fixed_edge 的区别：这里对灰度图做 Sobel，且直接用
+    梯度幅值做阈值，没有先模糊 BGR。适合边缘锐利的场景。
+
+    Args:
+        gray: 灰度图
+        min_area: 最小面积阈值
+
+    Returns:
+        (4, 2) 角点数组，或 None
+    """
     h, w = gray.shape[:2]
     border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
@@ -723,6 +1009,21 @@ def _sobel_gradient(gray: np.ndarray, min_area: float) -> np.ndarray | None:
 # ---------------------------------------------------------------------------
 
 def _color_segmentation(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
+    """[策略 6 — 颜色分割] 在 HSV / LAB 空间通过颜色掩码提取纸张区域。
+
+    通过 5 组不同松紧度的阈值在 HSV（色调/饱和度/明度）和 LAB（亮度）空间
+    对图像做掩码，提取可能的纸张区域。特别适合：
+    - 白色纸张在深色背景上
+    - 彩色纸张在对比背景上
+    - 普通亮度分割无法处理的场景
+
+    Args:
+        bgr: BGR 彩色图像
+        min_area: 最小面积阈值
+
+    Returns:
+        (4, 2) 角点数组，或 None
+    """
     h, w = bgr.shape[:2]
     border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(bgr, border, border, border, border,
@@ -780,6 +1081,20 @@ def _color_segmentation(bgr: np.ndarray, min_area: float) -> np.ndarray | None:
 def _hough_lines(gray: np.ndarray,
                   canny_low: int | None = None,
                   canny_high: int | None = None) -> np.ndarray | None:
+    """[策略 7 — Hough 直线检测] 用 Hough 变换找直线，从直线端点构造四边形。
+
+    对于边缘断裂严重但直线段明显的场景（如强光下的文档），
+    基于轮廓的方法可能找不到完整四边形。Hough 变换能检测出
+    不连续的直线段，然后取所有直线端点的凸包来逼近四边形。
+
+    Args:
+        gray: 灰度图
+        canny_low: Canny 低阈值
+        canny_high: Canny 高阈值
+
+    Returns:
+        (4, 2) 角点数组，或 None
+    """
     h, w = gray.shape[:2]
     border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
@@ -833,7 +1148,21 @@ def _hough_lines(gray: np.ndarray,
 
 def _fallback_detect(gray: np.ndarray, min_area: float,
                      w: int, h: int) -> np.ndarray | None:
-    """简单 Canny + 最大凸四边形检测，放宽评分要求作为最后兜底。"""
+    """[兜底 — 安全网] 所有策略都失败时的最终尝试。
+
+    放宽评分门槛（min_score = -500），用最简单的 Canny + 轮廓检测
+    取面积最大的近四边形作为结果。即使评分不高，也比完全没有结果好。
+
+    同时将角点裁剪到图像边界内，防止越界。
+
+    Args:
+        gray: 灰度图
+        min_area: 最小面积
+        w, h: 图像尺寸
+
+    Returns:
+        (4, 2) 角点数组（质量可能不高），或 None
+    """
     border = _cfg.detection.border_size
     padded = cv2.copyMakeBorder(gray, border, border, border, border,
                                  cv2.BORDER_CONSTANT, value=0)
@@ -877,10 +1206,26 @@ def find_document_contour(image: np.ndarray,
                           bgr: np.ndarray | None = None,
                           canny_low: int | None = None,
                           canny_high: int | None = None) -> np.ndarray | None:
-    """多策略文档角点检测。
+    """文档角点检测主入口 — 8 种策略级联执行，返回最优四边形角点。
 
-    按顺序尝试：亮度区域 → 多参数 Canny → 自适应阈值 → Sobel →
-    颜色分割 → Hough 直线。返回 (4, 2) 的角点数组，或 None。
+    执行流程：
+    1. 依次执行 8 种检测策略（按优先级从高到低）
+    2. 每个策略找到的四边形先经 _refine_corners_on_edges 精修
+    3. 用 _score_quad 综合评分，保留当前最高分
+    4. 如果最高分 > early_break_score（70分），提前退出，不再尝试后续策略
+    5. 如果所有策略都失败，调用 _fallback_detect 兜底
+
+    注意：`edges` 参数已废弃，仅保留是为了兼容性。
+
+    Args:
+        image: 灰度图（优先）或 BGR 图
+        bgr: BGR 原图，用于依赖彩色信息的策略（颜色分割、Sobel 固定阈值）
+        canny_low: 手动指定 Canny 低阈值（可选）
+        canny_high: 手动指定 Canny 高阈值（可选）
+        edges: 已废弃，保留仅为了接口兼容
+
+    Returns:
+        (4, 2) 的 float32 角点数组，未找到则返回 None
     """
     np.random.seed(12)  # 固定随机种子，确保 RANSAC 结果可重复
     gray = image if len(image.shape) == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -926,7 +1271,23 @@ def find_document_contour(image: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def order_corners(corners: np.ndarray) -> np.ndarray:
-    """排序为 [top-left, top-right, bottom-right, bottom-left]"""
+    """将四个角点按规范顺序排列：TL(左上) → TR(右上) → BR(右下) → BL(左下)。
+
+    排序方法：
+    - 左上角 = sum(x,y) 最小的点（坐标和最小）
+    - 右下角 = sum(x,y) 最大的点（坐标和最大）
+    - 右上角 = diff(y-x) 最小的点
+    - 左下角 = diff(y-x) 最大的点
+
+    这种排序是透视变换的前提条件，因为 getPerspectiveTransform 要求
+    源点和目标点一一对应。
+
+    Args:
+        corners: (4, 2) 的角点数组，顺序任意
+
+    Returns:
+        (4, 2) 的排序后角点数组，顺序为 [TL, TR, BR, BL]
+    """
     rect = np.zeros((4, 2), dtype=np.float32)
     s = corners.sum(axis=1)
     rect[0] = corners[np.argmin(s)]
@@ -939,9 +1300,18 @@ def order_corners(corners: np.ndarray) -> np.ndarray:
 
 def draw_document_contour(image: np.ndarray, corners: np.ndarray,
                           title: str = "Document Detection") -> np.ndarray:
-    """在图像上绘制检测到的文档轮廓和角点，用于调试和可视化。
+    """在原图上绘制检测到的文档轮廓和角点标签（用于可视化/调试）。
 
-    返回一份带标注的副本，不修改原图。
+    绿色四边形 + 蓝色实心圆标记角点 + TL/TR/BR/BL 文字标签。
+    返回的是副本，不修改原图。
+
+    Args:
+        image: BGR 或灰度原图
+        corners: (4, 2) 的角点数组
+        title: 窗口标题（未使用，保留兼容）
+
+    Returns:
+        带标注的 BGR 图像副本
     """
     out = image.copy()
     if len(out.shape) == 2:
@@ -960,9 +1330,21 @@ def draw_document_contour(image: np.ndarray, corners: np.ndarray,
 
 
 def draw_corners_on_canny(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
-    """在 Canny 边缘图上叠加检测到的角点和四边形，用于调试中间过程。
+    """在 Canny 边缘图上叠加检测到的四边形和角点（调试用）。
 
-    返回 BGR 彩色图像，黑色背景 + 白色边缘 + 绿色四边形 + 蓝色角点。
+    输出是 BGR 彩色图：
+    - 黑色背景 + 白色边缘（Canny 结果）
+    - 绿色四边形轮廓
+    - 蓝色实心角点 + 黄色文字标签
+
+    用于在 GUI 的「Canny 调试」Tab 中展示检测中间过程。
+
+    Args:
+        gray: 灰度图（用于计算 Canny 边缘）
+        corners: (4, 2) 的角点数组
+
+    Returns:
+        BGR 彩色调试图
     """
     low, high = auto_canny(gray)
     edges = cv2.Canny(gray, low, high)
